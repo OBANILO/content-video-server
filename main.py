@@ -397,8 +397,18 @@ def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Pat
         "-i", str(audio_path),
         "-t", str(audio_duration),
         "-vf", vf,
+
+        # FORCE correct streams:
+        # 0:v = Pexels video
+        # 1:a = ElevenLabs voiceover
+        # Without this, FFmpeg can keep silent audio from Pexels clips.
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-        "-c:a", "aac", "-b:a", "160k",
+        "-c:a", "aac", "-b:a", "192k",
+        "-ar", "44100",
+        "-ac", "2",
         "-shortest",
         str(output_path)
     ]
@@ -413,3 +423,15 @@ def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Pat
         raise RuntimeError(result.stderr.decode(errors="ignore")[-1200:])
     if not output_path.exists() or output_path.stat().st_size < 100000:
         raise RuntimeError("Final video render failed or file too small")
+
+    # Verify final video contains an audio stream.
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(output_path)
+    ]
+    audio_probe = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if b"audio" not in audio_probe.stdout:
+        raise RuntimeError("Final video has no audio stream")

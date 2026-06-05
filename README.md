@@ -1,10 +1,10 @@
-# Content Video Server - Related B-roll + No Top Title
+# Content Video Server - Audio Fixed
 
 Fixes:
-- Removes top title overlay and website watermark
-- Keeps captions only
-- Uses multiple topic-related Pexels searches instead of one generic repeated query
-- Adds IPTV-specific b-roll searches: sports TV, smart TV, remote, home theater, live sports, 4K TV
-- Avoids duplicate Pexels videos where possible
+- Forces FFmpeg to use ElevenLabs voiceover as the audio track
+- Avoids silent Pexels audio being selected
+- Keeps related topic b-roll
+- Keeps no top title overlay
+- Validates final MP4 contains audio stream
 
-Deploy on Render as before.
+Deploy to Render and generate a fresh video.
