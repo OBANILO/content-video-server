@@ -19,7 +19,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title=APP_NAME)
-
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 class GenerateRequest(BaseModel):
@@ -121,9 +120,7 @@ def run_generation(data: Dict[str, Any], job_id: str):
             clips=clips,
             audio_path=audio_path,
             subtitles_path=subtitles_path,
-            output_path=final_path,
-            title=data.get("title", "Generated Video"),
-            website=data.get("website", "")
+            output_path=final_path
         )
 
         public_base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
@@ -243,7 +240,7 @@ def make_simple_srt(script: str, output_path: Path):
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
-def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Path, output_path: Path, title: str, website: str):
+def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Path, output_path: Path):
     audio_duration = max(10, get_duration(audio_path))
     concat_file = TEMP_DIR / f"concat_{output_path.stem}.txt"
 
@@ -261,20 +258,15 @@ def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Pat
 
     concat_file.write_text("\n".join(entries), encoding="utf-8")
 
-    def esc(txt: str) -> str:
-        return (txt or "").replace(":", "\\:").replace("'", "\\'").replace("%", "\\%")
-
     sub_path = subtitles_path.as_posix().replace(":", "\\:")
-    safe_title = esc(title[:80])
-    safe_site = esc(website[:100])
 
+    # ✅ NO TOP TITLE AND NO WEBSITE WATERMARK.
+    # Only subtitles/captions remain at the bottom.
     vf = (
         "scale=1280:720:force_original_aspect_ratio=increase,"
         "crop=1280:720,"
         "format=yuv420p,"
-        f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2',"
-        f"drawtext=text='{safe_title}':x=40:y=35:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=12,"
-        f"drawtext=text='{safe_site}':x=40:y=h-70:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=8"
+        f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2'"
     )
 
     cmd = [
