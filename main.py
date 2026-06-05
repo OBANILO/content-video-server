@@ -1,0 +1,301 @@
+import os
+import time
+import uuid
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+
+import requests
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+APP_NAME = "content-video-server"
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
+TEMP_DIR = BASE_DIR / "tmp"
+OUTPUT_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(exist_ok=True)
+
+app = FastAPI(title=APP_NAME)
+
+JOBS: Dict[str, Dict[str, Any]] = {}
+
+class GenerateRequest(BaseModel):
+    api_key: str = Field(..., description="Same acg_api_key from WordPress")
+    script: str
+    title: str = "Generated Video"
+    language: str = "English"
+    website: str = ""
+    video_type: str = "marketing"
+    search_query: str = "business office technology"
+    elevenlabs_key: str
+    elevenlabs_voice: str
+    pexels_key: str
+    openai_key: Optional[str] = None
+
+@app.get("/")
+def home():
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "endpoints": {
+            "generate": "POST /generate",
+            "status": "GET /status/{api_key}",
+            "outputs": "GET /outputs/{file}.mp4"
+        }
+    }
+
+@app.post("/generate")
+def generate_video(req: GenerateRequest, background_tasks: BackgroundTasks):
+    if len(req.script.strip()) < 50:
+        raise HTTPException(status_code=400, detail="script too short")
+    if not req.elevenlabs_key or not req.elevenlabs_voice:
+        raise HTTPException(status_code=400, detail="ElevenLabs key/voice missing")
+    if not req.pexels_key:
+        raise HTTPException(status_code=400, detail="Pexels key missing")
+
+    job_id = str(uuid.uuid4())
+    JOBS[req.api_key] = {
+        "job_id": job_id,
+        "status": "processing",
+        "step": "queued",
+        "created_at": time.time(),
+        "video_url": "",
+        "error": "",
+        "title": req.title,
+        "video_type": req.video_type,
+    }
+
+    background_tasks.add_task(run_generation, req.model_dump(), job_id)
+    return {"ok": True, "status": "processing", "job_id": job_id}
+
+@app.get("/status/{api_key}")
+def status(api_key: str):
+    job = JOBS.get(api_key)
+    if not job:
+        return {"status": "idle", "step": "no job found"}
+    return job
+
+app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+
+def update_job(api_key: str, **kwargs):
+    if api_key in JOBS:
+        JOBS[api_key].update(kwargs)
+
+def run_generation(data: Dict[str, Any], job_id: str):
+    api_key = data["api_key"]
+    work = TEMP_DIR / job_id
+    work.mkdir(exist_ok=True)
+
+    try:
+        update_job(api_key, step="creating voiceover")
+        audio_path = work / "voice.mp3"
+        make_voiceover(
+            text=data["script"],
+            elevenlabs_key=data["elevenlabs_key"],
+            voice_id=data["elevenlabs_voice"],
+            output_path=audio_path
+        )
+
+        update_job(api_key, step="getting Pexels clips")
+        clips = download_pexels_clips(
+            query=data.get("search_query") or "business office technology",
+            pexels_key=data["pexels_key"],
+            work_dir=work,
+            max_clips=8
+        )
+
+        if not clips:
+            update_job(api_key, step="no clips found, creating fallback background")
+            clips = [create_color_video(work / "fallback.mp4", duration=30)]
+
+        update_job(api_key, step="creating captions")
+        subtitles_path = work / "captions.srt"
+        make_simple_srt(data["script"], subtitles_path)
+
+        update_job(api_key, step="rendering final video")
+        final_path = OUTPUT_DIR / f"{job_id}.mp4"
+        render_video_ffmpeg(
+            clips=clips,
+            audio_path=audio_path,
+            subtitles_path=subtitles_path,
+            output_path=final_path,
+            title=data.get("title", "Generated Video"),
+            website=data.get("website", "")
+        )
+
+        public_base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
+        if public_base:
+            video_url = public_base.rstrip("/") + f"/outputs/{job_id}.mp4"
+        else:
+            video_url = f"/outputs/{job_id}.mp4"
+
+        update_job(api_key, status="completed", step="done", video_url=video_url)
+
+    except Exception as e:
+        update_job(api_key, status="error", step="failed", error=str(e))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+def make_voiceover(text: str, elevenlabs_key: str, voice_id: str, output_path: Path):
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    payload = {
+        "text": text[:5000],
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": 0.45,
+            "similarity_boost": 0.75,
+            "style": 0.25,
+            "use_speaker_boost": True
+        }
+    }
+    headers = {
+        "xi-api-key": elevenlabs_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg"
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=180)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {r.text[:300]}")
+    output_path.write_bytes(r.content)
+    if output_path.stat().st_size < 1000:
+        raise RuntimeError("Voiceover file is empty")
+
+def download_pexels_clips(query: str, pexels_key: str, work_dir: Path, max_clips: int = 8) -> List[Path]:
+    headers = {"Authorization": pexels_key}
+    r = requests.get(
+        "https://api.pexels.com/videos/search",
+        headers=headers,
+        params={"query": query, "per_page": max_clips, "orientation": "landscape", "size": "medium"},
+        timeout=45
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Pexels error {r.status_code}: {r.text[:200]}")
+
+    paths = []
+    for i, video in enumerate(r.json().get("videos", [])[:max_clips]):
+        files = video.get("video_files", [])
+        candidates = sorted(
+            [f for f in files if f.get("file_type") == "video/mp4" and f.get("link")],
+            key=lambda f: abs((f.get("height") or 720) - 720)
+        )
+        if not candidates:
+            continue
+
+        link = candidates[0]["link"]
+        out = work_dir / f"clip_{i}.mp4"
+        try:
+            with requests.get(link, stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                with open(out, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            if out.exists() and out.stat().st_size > 50000:
+                paths.append(out)
+        except Exception:
+            continue
+
+    return paths
+
+def create_color_video(output_path: Path, duration: int = 30) -> Path:
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={duration}",
+        "-pix_fmt", "yuv420p", str(output_path)
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return output_path
+
+def get_duration(path: Path) -> float:
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path)
+    ]
+    out = subprocess.check_output(cmd).decode().strip()
+    return float(out)
+
+def make_simple_srt(script: str, output_path: Path):
+    words = script.replace("\n", " ").split()
+    chunks = []
+    for i in range(0, len(words), 9):
+        chunks.append(" ".join(words[i:i+9]))
+
+    def fmt(sec: float) -> str:
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        s = int(sec % 60)
+        ms = int((sec - int(sec)) * 1000)
+        return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+    lines = []
+    t = 0.0
+    for idx, chunk in enumerate(chunks[:400], start=1):
+        start = t
+        end = t + 3.5
+        lines.append(str(idx))
+        lines.append(f"{fmt(start)} --> {fmt(end)}")
+        lines.append(chunk)
+        lines.append("")
+        t = end
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Path, output_path: Path, title: str, website: str):
+    audio_duration = max(10, get_duration(audio_path))
+    concat_file = TEMP_DIR / f"concat_{output_path.stem}.txt"
+
+    entries = []
+    total = 0.0
+    index = 0
+    while total < audio_duration + 3:
+        clip = clips[index % len(clips)]
+        entries.append(f"file '{clip.as_posix()}'")
+        try:
+            total += max(2, get_duration(clip))
+        except Exception:
+            total += 5
+        index += 1
+
+    concat_file.write_text("\n".join(entries), encoding="utf-8")
+
+    def esc(txt: str) -> str:
+        return (txt or "").replace(":", "\\:").replace("'", "\\'").replace("%", "\\%")
+
+    sub_path = subtitles_path.as_posix().replace(":", "\\:")
+    safe_title = esc(title[:80])
+    safe_site = esc(website[:100])
+
+    vf = (
+        "scale=1280:720:force_original_aspect_ratio=increase,"
+        "crop=1280:720,"
+        "format=yuv420p,"
+        f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2',"
+        f"drawtext=text='{safe_title}':x=40:y=35:fontsize=34:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=12,"
+        f"drawtext=text='{safe_site}':x=40:y=h-70:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.45:boxborderw=8"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-i", str(audio_path),
+        "-t", str(audio_duration),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+        "-c:a", "aac", "-b:a", "160k",
+        "-shortest",
+        str(output_path)
+    ]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        concat_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="ignore")[-1200:])
+    if not output_path.exists() or output_path.stat().st_size < 100000:
+        raise RuntimeError("Final video render failed or file too small")
