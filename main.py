@@ -106,7 +106,7 @@ def run_generation(data: Dict[str, Any], job_id: str):
             script=data.get("script", ""),
             pexels_key=data["pexels_key"],
             work_dir=work,
-            max_clips=10
+            max_clips=32
         )
 
         if not clips:
@@ -165,157 +165,201 @@ def make_voiceover(text: str, elevenlabs_key: str, voice_id: str, output_path: P
 
 def build_pexels_queries(query: str, title: str = "", script: str = "") -> List[str]:
     """
-    Build multiple topic-specific Pexels searches.
-    This prevents every video from using the same generic b-roll.
+    Build strong Pexels search phrases from the exact topic.
+    User/AI exact search terms come first, then niche-specific searches.
     """
-    text = f"{query} {title} {script[:1200]}".lower()
+    text = f"{query} {title} {script[:1500]}".lower()
     queries = []
 
-    # Use comma/pipe-separated queries from WordPress first.
-    for part in str(query or "").replace("|", ",").split(","):
+    for part in str(query or "").replace("|", ",").replace(";", ",").split(","):
         part = part.strip()
         if part and len(part) >= 3:
             queries.append(part)
 
-    # Topic-specific query packs.
-    if any(w in text for w in ["iptv", "live tv", "streaming", "4k", "uhd", "sports channel", "football", "soccer", "nba", "nfl", "world cup"]):
+    if any(w in text for w in ["iptv", "live tv", "streaming", "4k", "uhd", "buffer", "sports", "football", "soccer", "nba", "nfl", "world cup", "watch tv", "watching tv"]):
         queries += [
+            "watching tv",
+            "watching television",
+            "people watching tv",
             "watching football on tv",
-            "watching sports on television",
-            "smart tv remote control",
-            "home theater tv",
-            "live sports tv screen",
-            "soccer match television",
+            "watching sports on tv",
             "family watching tv",
-            "man watching tv remote",
-            "4k television living room",
-            "streaming television remote"
+            "friends watching tv",
+            "living room tv",
+            "smart tv remote",
+            "remote control tv",
+            "home theater tv",
+            "football match television",
+            "soccer match tv",
+            "sports bar tv",
+            "streaming tv",
+            "4k tv living room"
         ]
-    elif any(w in text for w in ["instagram", "tiktok", "followers", "social media", "likes", "creator"]):
+    elif any(w in text for w in ["instagram", "tiktok", "followers", "social media", "likes", "creator", "influencer"]):
         queries += [
             "social media phone",
+            "phone social media",
             "creator using phone",
-            "instagram phone app",
-            "woman using smartphone",
-            "content creator laptop",
-            "phone scrolling social media",
+            "content creator phone",
             "influencer recording video",
-            "online marketing phone"
+            "woman using smartphone",
+            "man using smartphone",
+            "laptop social media",
+            "marketing phone",
+            "scrolling phone"
         ]
-    elif any(w in text for w in ["chatbot", "ai bot", "ai assistant", "customer support", "live chat"]):
+    elif any(w in text for w in ["chatbot", "ai bot", "ai assistant", "customer support", "live chat", "automation"]):
         queries += [
-            "customer support chatbot",
-            "business ai technology",
-            "support agent computer",
-            "chat app computer",
-            "business dashboard screen",
+            "customer support computer",
+            "business technology office",
+            "chat support computer",
             "call center support",
-            "website chat support"
+            "business dashboard screen",
+            "website chat support",
+            "ai technology office",
+            "person using laptop"
         ]
-    elif any(w in text for w in ["shopify", "payment", "checkout", "ecommerce", "online store"]):
+    elif any(w in text for w in ["shopify", "payment", "checkout", "ecommerce", "online store", "stripe"]):
         queries += [
             "online shopping checkout",
             "ecommerce payment laptop",
-            "credit card online payment",
-            "small business online store",
-            "packing ecommerce order",
-            "shopping cart checkout"
+            "credit card payment",
+            "online store laptop",
+            "small business laptop",
+            "packing online order",
+            "shopping cart checkout",
+            "business payment"
         ]
-    elif any(w in text for w in ["youtube", "subscribers", "channel", "monetization"]):
+    elif any(w in text for w in ["youtube", "subscribers", "channel", "monetization", "watch hours"]):
         queries += [
-            "youtube creator camera",
-            "content creator desk",
+            "youtube creator",
+            "content creator camera",
             "video editing laptop",
             "creator recording video",
-            "analytics dashboard computer",
-            "vlogger filming camera"
+            "vlogger camera",
+            "analytics dashboard",
+            "studio recording video",
+            "person filming video"
         ]
     else:
         queries += [
-            "business website laptop",
             "person using laptop",
+            "business website laptop",
             "online service computer",
             "digital marketing office",
+            "people watching screen",
             "website dashboard screen"
         ]
 
-    # Clean + de-duplicate while preserving order.
-    cleaned = []
-    seen = set()
+    cleaned, seen = [], set()
     for q in queries:
-        q = re.sub(r"[^a-zA-Z0-9\\s-]", " ", q).strip().lower()
-        q = re.sub(r"\\s+", " ", q)
+        q = re.sub(r"[^a-zA-Z0-9\s-]", " ", q).strip().lower()
+        q = re.sub(r"\s+", " ", q)
         if q and q not in seen:
             cleaned.append(q)
             seen.add(q)
 
-    return cleaned[:12]
+    return cleaned[:18]
 
 
-def download_pexels_clips(query: str, title: str, script: str, pexels_key: str, work_dir: Path, max_clips: int = 10) -> List[Path]:
-    import random
+def pick_best_video_file(files: list) -> Optional[str]:
+    candidates = []
+    for f in files:
+        if f.get("file_type") != "video/mp4" or not f.get("link"):
+            continue
+        w = int(f.get("width") or 0)
+        h = int(f.get("height") or 0)
+        if w <= 0 or h <= 0 or w < h:
+            continue
+        score = abs(h - 720) + abs((w / max(h, 1)) - (16/9)) * 400
+        candidates.append((score, f["link"]))
 
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
+    for f in files:
+        if f.get("file_type") == "video/mp4" and f.get("link"):
+            return f["link"]
+    return None
+
+
+def download_pexels_clips(query: str, title: str, script: str, pexels_key: str, work_dir: Path, max_clips: int = 32) -> List[Path]:
+    """
+    Downloads many UNIQUE topic-related clips.
+    It searches multiple Pexels queries/pages and avoids repeating the same video ID/link.
+    """
     headers = {"Authorization": pexels_key}
     queries = build_pexels_queries(query, title, script)
 
-    paths = []
+    paths: List[Path] = []
     used_video_ids = set()
+    used_links = set()
+    pages = [1, 2, 3, 4, 5]
 
-    # Try several topic-specific searches, random pages, and avoid duplicate videos.
-    for search_i, q in enumerate(queries):
+    for q in queries:
         if len(paths) >= max_clips:
             break
 
-        params = {
-            "query": q,
-            "per_page": 6,
-            "orientation": "landscape",
-            "size": "medium",
-            "page": random.randint(1, 4)
-        }
-
-        try:
-            r = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=45)
-            if r.status_code >= 400:
-                continue
-            videos = r.json().get("videos", [])
-        except Exception:
-            continue
-
-        random.shuffle(videos)
-
-        for video in videos:
+        for page in pages:
             if len(paths) >= max_clips:
                 break
 
-            vid = str(video.get("id", ""))
-            if vid and vid in used_video_ids:
-                continue
-
-            files = video.get("video_files", [])
-            candidates = sorted(
-                [f for f in files if f.get("file_type") == "video/mp4" and f.get("link")],
-                key=lambda f: abs((f.get("height") or 720) - 720)
-            )
-            if not candidates:
-                continue
-
-            link = candidates[0]["link"]
-            out = work_dir / f"clip_{len(paths)}_{search_i}.mp4"
+            params = {
+                "query": q,
+                "per_page": 12,
+                "orientation": "landscape",
+                "size": "medium",
+                "page": page
+            }
 
             try:
-                with requests.get(link, stream=True, timeout=120) as resp:
-                    resp.raise_for_status()
-                    with open(out, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                f.write(chunk)
-                if out.exists() and out.stat().st_size > 50000:
-                    paths.append(out)
-                    if vid:
-                        used_video_ids.add(vid)
+                r = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=45)
+                if r.status_code >= 400:
+                    continue
+                videos = r.json().get("videos", [])
             except Exception:
                 continue
+
+            # Page order first, then shuffle rest for freshness
+            top = videos[:4]
+            rest = videos[4:]
+            random.shuffle(rest)
+            videos = top + rest
+
+            for video in videos:
+                if len(paths) >= max_clips:
+                    break
+
+                vid = str(video.get("id", ""))
+                if vid and vid in used_video_ids:
+                    continue
+
+                link = pick_best_video_file(video.get("video_files", []))
+                if not link or link in used_links:
+                    continue
+
+                out = work_dir / f"pexels_{len(paths):02d}_{vid or random.randint(1000,9999)}.mp4"
+
+                try:
+                    with requests.get(link, stream=True, timeout=120) as resp:
+                        resp.raise_for_status()
+                        with open(out, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+
+                    if out.exists() and out.stat().st_size > 100000:
+                        paths.append(out)
+                        if vid:
+                            used_video_ids.add(vid)
+                        used_links.add(link)
+                except Exception:
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
 
     return paths
 
@@ -363,27 +407,67 @@ def make_simple_srt(script: str, output_path: Path):
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Path, output_path: Path):
+    """
+    Creates short unique b-roll segments so each part uses a fresh clip.
+    Final audio is forced to ElevenLabs voiceover.
+    """
     audio_duration = max(10, get_duration(audio_path))
-    concat_file = TEMP_DIR / f"concat_{output_path.stem}.txt"
+    segment_dir = TEMP_DIR / f"segments_{output_path.stem}"
+    segment_dir.mkdir(exist_ok=True)
 
-    entries = []
-    total = 0.0
-    index = 0
-    while total < audio_duration + 3:
-        clip = clips[index % len(clips)]
-        entries.append(f"file '{clip.as_posix()}'")
+    segment_duration = 6.0
+    needed_segments = int(audio_duration / segment_duration) + 2
+
+    usable_clips = clips[:]
+    random.shuffle(usable_clips)
+
+    segment_paths: List[Path] = []
+    used = usable_clips[:needed_segments]
+
+    for i, clip in enumerate(used):
         try:
-            total += max(2, get_duration(clip))
+            dur = get_duration(clip)
         except Exception:
-            total += 5
-        index += 1
+            dur = segment_duration
 
-    concat_file.write_text("\n".join(entries), encoding="utf-8")
+        if dur > segment_duration + 1:
+            start_at = random.uniform(0, max(0, dur - segment_duration - 0.5))
+        else:
+            start_at = 0
+
+        seg = segment_dir / f"seg_{i:03d}.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_at),
+            "-i", str(clip),
+            "-t", str(segment_duration),
+            "-an",
+            "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            str(seg)
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and seg.exists() and seg.stat().st_size > 50000:
+            segment_paths.append(seg)
+
+    if not segment_paths:
+        segment_paths.append(create_color_video(segment_dir / "fallback.mp4", duration=int(audio_duration) + 2))
+
+    # Repeat only as final fallback if Pexels gave too few unique clips.
+    if len(segment_paths) < needed_segments:
+        base = segment_paths[:]
+        repeat_i = 0
+        while len(segment_paths) < needed_segments:
+            src = base[repeat_i % len(base)]
+            dst = segment_dir / f"fallback_repeat_{len(segment_paths):03d}.mp4"
+            shutil.copy(src, dst)
+            segment_paths.append(dst)
+            repeat_i += 1
+
+    concat_file = TEMP_DIR / f"concat_{output_path.stem}.txt"
+    concat_file.write_text("\n".join([f"file '{p.as_posix()}'" for p in segment_paths]), encoding="utf-8")
 
     sub_path = subtitles_path.as_posix().replace(":", "\\:")
-
-    # ✅ NO TOP TITLE AND NO WEBSITE WATERMARK.
-    # Only subtitles/captions remain at the bottom.
     vf = (
         "scale=1280:720:force_original_aspect_ratio=increase,"
         "crop=1280:720,"
@@ -397,14 +481,8 @@ def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Pat
         "-i", str(audio_path),
         "-t", str(audio_duration),
         "-vf", vf,
-
-        # FORCE correct streams:
-        # 0:v = Pexels video
-        # 1:a = ElevenLabs voiceover
-        # Without this, FFmpeg can keep silent audio from Pexels clips.
         "-map", "0:v:0",
         "-map", "1:a:0",
-
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
         "-c:a", "aac", "-b:a", "192k",
         "-ar", "44100",
@@ -414,6 +492,7 @@ def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Pat
     ]
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     try:
         concat_file.unlink(missing_ok=True)
     except Exception:
@@ -421,10 +500,10 @@ def render_video_ffmpeg(clips: List[Path], audio_path: Path, subtitles_path: Pat
 
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="ignore")[-1200:])
+
     if not output_path.exists() or output_path.stat().st_size < 100000:
         raise RuntimeError("Final video render failed or file too small")
 
-    # Verify final video contains an audio stream.
     probe_cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "a:0",
