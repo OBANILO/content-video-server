@@ -1,11 +1,10 @@
-# Content Video Server - No Top Title
+# Content Video Server - Related B-roll + No Top Title
 
-This version removes:
-- top video title overlay
-- bottom website watermark overlay
+Fixes:
+- Removes top title overlay and website watermark
+- Keeps captions only
+- Uses multiple topic-related Pexels searches instead of one generic repeated query
+- Adds IPTV-specific b-roll searches: sports TV, smart TV, remote, home theater, live sports, 4K TV
+- Avoids duplicate Pexels videos where possible
 
-It keeps:
-- captions/subtitles
-- voiceover
-- Pexels video clips
-- /generate and /status endpoints
+Deploy on Render as before.

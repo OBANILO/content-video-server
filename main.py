@@ -101,9 +101,11 @@ def run_generation(data: Dict[str, Any], job_id: str):
         update_job(api_key, step="getting Pexels clips")
         clips = download_pexels_clips(
             query=data.get("search_query") or "business office technology",
+            title=data.get("title", ""),
+            script=data.get("script", ""),
             pexels_key=data["pexels_key"],
             work_dir=work,
-            max_clips=8
+            max_clips=10
         )
 
         if not clips:
@@ -160,40 +162,159 @@ def make_voiceover(text: str, elevenlabs_key: str, voice_id: str, output_path: P
     if output_path.stat().st_size < 1000:
         raise RuntimeError("Voiceover file is empty")
 
-def download_pexels_clips(query: str, pexels_key: str, work_dir: Path, max_clips: int = 8) -> List[Path]:
+def build_pexels_queries(query: str, title: str = "", script: str = "") -> List[str]:
+    """
+    Build multiple topic-specific Pexels searches.
+    This prevents every video from using the same generic b-roll.
+    """
+    text = f"{query} {title} {script[:1200]}".lower()
+    queries = []
+
+    # Use comma/pipe-separated queries from WordPress first.
+    for part in str(query or "").replace("|", ",").split(","):
+        part = part.strip()
+        if part and len(part) >= 3:
+            queries.append(part)
+
+    # Topic-specific query packs.
+    if any(w in text for w in ["iptv", "live tv", "streaming", "4k", "uhd", "sports channel", "football", "soccer", "nba", "nfl", "world cup"]):
+        queries += [
+            "watching football on tv",
+            "watching sports on television",
+            "smart tv remote control",
+            "home theater tv",
+            "live sports tv screen",
+            "soccer match television",
+            "family watching tv",
+            "man watching tv remote",
+            "4k television living room",
+            "streaming television remote"
+        ]
+    elif any(w in text for w in ["instagram", "tiktok", "followers", "social media", "likes", "creator"]):
+        queries += [
+            "social media phone",
+            "creator using phone",
+            "instagram phone app",
+            "woman using smartphone",
+            "content creator laptop",
+            "phone scrolling social media",
+            "influencer recording video",
+            "online marketing phone"
+        ]
+    elif any(w in text for w in ["chatbot", "ai bot", "ai assistant", "customer support", "live chat"]):
+        queries += [
+            "customer support chatbot",
+            "business ai technology",
+            "support agent computer",
+            "chat app computer",
+            "business dashboard screen",
+            "call center support",
+            "website chat support"
+        ]
+    elif any(w in text for w in ["shopify", "payment", "checkout", "ecommerce", "online store"]):
+        queries += [
+            "online shopping checkout",
+            "ecommerce payment laptop",
+            "credit card online payment",
+            "small business online store",
+            "packing ecommerce order",
+            "shopping cart checkout"
+        ]
+    elif any(w in text for w in ["youtube", "subscribers", "channel", "monetization"]):
+        queries += [
+            "youtube creator camera",
+            "content creator desk",
+            "video editing laptop",
+            "creator recording video",
+            "analytics dashboard computer",
+            "vlogger filming camera"
+        ]
+    else:
+        queries += [
+            "business website laptop",
+            "person using laptop",
+            "online service computer",
+            "digital marketing office",
+            "website dashboard screen"
+        ]
+
+    # Clean + de-duplicate while preserving order.
+    cleaned = []
+    seen = set()
+    for q in queries:
+        q = re.sub(r"[^a-zA-Z0-9\\s-]", " ", q).strip().lower()
+        q = re.sub(r"\\s+", " ", q)
+        if q and q not in seen:
+            cleaned.append(q)
+            seen.add(q)
+
+    return cleaned[:12]
+
+
+def download_pexels_clips(query: str, title: str, script: str, pexels_key: str, work_dir: Path, max_clips: int = 10) -> List[Path]:
+    import random
+
     headers = {"Authorization": pexels_key}
-    r = requests.get(
-        "https://api.pexels.com/videos/search",
-        headers=headers,
-        params={"query": query, "per_page": max_clips, "orientation": "landscape", "size": "medium"},
-        timeout=45
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Pexels error {r.status_code}: {r.text[:200]}")
+    queries = build_pexels_queries(query, title, script)
 
     paths = []
-    for i, video in enumerate(r.json().get("videos", [])[:max_clips]):
-        files = video.get("video_files", [])
-        candidates = sorted(
-            [f for f in files if f.get("file_type") == "video/mp4" and f.get("link")],
-            key=lambda f: abs((f.get("height") or 720) - 720)
-        )
-        if not candidates:
-            continue
+    used_video_ids = set()
 
-        link = candidates[0]["link"]
-        out = work_dir / f"clip_{i}.mp4"
+    # Try several topic-specific searches, random pages, and avoid duplicate videos.
+    for search_i, q in enumerate(queries):
+        if len(paths) >= max_clips:
+            break
+
+        params = {
+            "query": q,
+            "per_page": 6,
+            "orientation": "landscape",
+            "size": "medium",
+            "page": random.randint(1, 4)
+        }
+
         try:
-            with requests.get(link, stream=True, timeout=120) as resp:
-                resp.raise_for_status()
-                with open(out, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-            if out.exists() and out.stat().st_size > 50000:
-                paths.append(out)
+            r = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=45)
+            if r.status_code >= 400:
+                continue
+            videos = r.json().get("videos", [])
         except Exception:
             continue
+
+        random.shuffle(videos)
+
+        for video in videos:
+            if len(paths) >= max_clips:
+                break
+
+            vid = str(video.get("id", ""))
+            if vid and vid in used_video_ids:
+                continue
+
+            files = video.get("video_files", [])
+            candidates = sorted(
+                [f for f in files if f.get("file_type") == "video/mp4" and f.get("link")],
+                key=lambda f: abs((f.get("height") or 720) - 720)
+            )
+            if not candidates:
+                continue
+
+            link = candidates[0]["link"]
+            out = work_dir / f"clip_{len(paths)}_{search_i}.mp4"
+
+            try:
+                with requests.get(link, stream=True, timeout=120) as resp:
+                    resp.raise_for_status()
+                    with open(out, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                if out.exists() and out.stat().st_size > 50000:
+                    paths.append(out)
+                    if vid:
+                        used_video_ids.add(vid)
+            except Exception:
+                continue
 
     return paths
 
