@@ -1,14 +1,10 @@
-# Content Video Server - Conversion Engine
+# Content Video Server - Smooth Video Fixed
 
-Adds:
-- niche detection
-- ChatGPT/OpenAI conversion image generation
-- optional website screenshots
-- fresh Pexels b-roll
-- mixed timeline: generated images + screenshots + Pexels clips
-- fixed ElevenLabs audio mapping
-- no top title overlay
-- no website watermark
+Fixes:
+- Forces Pexels clip segments to constant 30 FPS
+- Resets timestamps on segments
+- Forces final render to CFR 30 FPS
+- Adds audio sync with aresample
+- Adds faststart and yuv420p for smoother YouTube playback
 
-Optional screenshot environment variable:
-WEBSITE_SCREENSHOT_API=https://shot.screenshotapi.net/screenshot?token=YOUR_TOKEN&url={url}&output=image&file_type=png
+Deploy on Render and generate a fresh video.

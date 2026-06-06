@@ -360,7 +360,7 @@ def convert_image_to_video_frame(input_path: Path, output_path: Path):
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
-        "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuv420p",
+        "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p",
         "-frames:v", "1",
         str(output_path)
     ]
@@ -507,8 +507,8 @@ def make_simple_srt(script: str, output_path: Path):
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 def make_image_segment(image_path: Path, output_path: Path, duration: float = 6.0):
-    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,zoompan=z='min(zoom+0.0015,1.08)':d=150:s=1280x720,format=yuv420p"
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(image_path), "-t", str(duration), "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", str(output_path)]
+    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,zoompan=z='min(zoom+0.0010,1.06)':d=180:s=1280x720:fps=30,format=yuv420p"
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(image_path), "-t", str(duration), "-vf", vf, "-an", "-r", "30", "-vsync", "cfr", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
 def render_mixed_video(clips: List[Path], images: List[Path], audio_path: Path, subtitles_path: Path, output_path: Path):
@@ -546,7 +546,7 @@ def render_mixed_video(clips: List[Path], images: List[Path], audio_path: Path, 
                 dur = segment_duration
             start_at = random.uniform(0, max(0, dur - segment_duration - 0.5)) if dur > segment_duration + 1 else 0
             seg = segment_dir / f"vid_{i:03d}.mp4"
-            cmd = ["ffmpeg", "-y", "-ss", str(start_at), "-i", str(clip), "-t", str(segment_duration), "-an", "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", str(seg)]
+            cmd = ["ffmpeg", "-y", "-ss", str(start_at), "-i", str(clip), "-t", str(segment_duration), "-an", "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p", "-r", "30", "-vsync", "cfr", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(seg)]
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if res.returncode == 0 and seg.exists() and seg.stat().st_size > 50000:
                 segment_paths.append(seg)
@@ -559,9 +559,32 @@ def render_mixed_video(clips: List[Path], images: List[Path], audio_path: Path, 
     concat_file = TEMP_DIR / f"concat_{output_path.stem}.txt"
     concat_file.write_text("\n".join([f"file '{p.as_posix()}'" for p in segment_paths]), encoding="utf-8")
     sub_path = subtitles_path.as_posix().replace(":", "\\:")
-    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuv420p," + f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2'"
+    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p," + f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2'"
 
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-i", str(audio_path), "-t", str(audio_duration), "-vf", vf, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-shortest", str(output_path)]
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-i", str(audio_path),
+        "-t", str(audio_duration),
+        "-vf", vf + ",fps=30,setpts=PTS-STARTPTS",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-r", "30",
+        "-vsync", "cfr",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-af", "aresample=async=1:first_pts=0",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(output_path)
+    ]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         concat_file.unlink(missing_ok=True)
