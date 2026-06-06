@@ -1,10 +1,14 @@
-# Content Video Server - Fresh Pexels B-roll Fixed v2
+# Content Video Server - Conversion Engine
 
-Fixes:
-- Adds missing random/re imports
-- Uses multiple exact Pexels search phrases
-- Downloads up to 32 unique Pexels videos
-- Avoids duplicate Pexels video IDs and links
-- Cuts clips into 6-second fresh parts
-- Forces ElevenLabs voiceover as final audio
-- Removes top title overlay and website watermark
+Adds:
+- niche detection
+- ChatGPT/OpenAI conversion image generation
+- optional website screenshots
+- fresh Pexels b-roll
+- mixed timeline: generated images + screenshots + Pexels clips
+- fixed ElevenLabs audio mapping
+- no top title overlay
+- no website watermark
+
+Optional screenshot environment variable:
+WEBSITE_SCREENSHOT_API=https://shot.screenshotapi.net/screenshot?token=YOUR_TOKEN&url={url}&output=image&file_type=png
