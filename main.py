@@ -130,7 +130,7 @@ def run_generation(data: Dict[str, Any], job_id: str):
             niche=niche,
             pexels_key=data["pexels_key"],
             work_dir=work,
-            max_clips=32
+            max_clips=10
         )
 
         update_job(api_key, step="creating captions")
