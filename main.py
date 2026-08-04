@@ -53,6 +53,9 @@ class GenerateRequest(BaseModel):
     scenes: Optional[List[Dict[str, Any]]] = []
     # NEW: AI conversion images are off by default (they are the biggest memory spike)
     use_ai_images: bool = False
+    # NEW: user-recorded screen captures.
+    # [{"url": "https://site/clip1.mp4", "position": "middle"|"end"}]
+    custom_clips: Optional[List[Dict[str, Any]]] = []
 
 @app.get("/")
 def home():
@@ -146,6 +149,12 @@ def run_generation(data: Dict[str, Any], job_id: str):
             screenshots=screenshots,
             extra_images=conversion_images
         )
+
+        if data.get("custom_clips"):
+            update_job(api_key, step="adding your recorded clips")
+            customs = download_custom_clips(data["custom_clips"], work)
+            place_custom_clips(scenes, customs)
+            update_job(api_key, custom_clips_used=len(customs))
 
         update_job(api_key, step="creating captions")
         subtitles_path = work / "captions.srt"
@@ -386,6 +395,112 @@ def download_clip_for_query(query: str, pexels_key: str, work_dir: Path, idx: in
                         pass
                     continue
     return None
+
+# ══════════════════════════════════════════════════════════════════
+# USER-RECORDED CLIPS (website walkthrough, how-to-subscribe, ...)
+# ══════════════════════════════════════════════════════════════════
+
+def download_custom_clips(clips: List[Dict[str, Any]], work_dir: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for i, c in enumerate(clips or []):
+        url = str((c or {}).get("url") or "").strip()
+        position = str((c or {}).get("position") or "middle").strip().lower()
+        if not url:
+            continue
+        if position not in ("middle", "end", "start"):
+            position = "middle"
+
+        dest = work_dir / f"custom_{i}.mp4"
+        try:
+            with requests.get(url, stream=True, timeout=180) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+        except Exception:
+            continue
+
+        if not dest.exists() or dest.stat().st_size < 50000:
+            continue
+        try:
+            dur = get_duration(dest)
+        except Exception:
+            dur = 0.0
+        if dur <= 0.5:
+            continue
+
+        out.append({"path": dest, "position": position, "duration": dur})
+    return out
+
+def place_custom_clips(scenes: List[Dict[str, Any]], customs: List[Dict[str, Any]]):
+    """
+    Lay each recording over a run of consecutive scenes so the voiceover keeps
+    talking while the recording plays through from start to finish.
+    """
+    if not scenes or not customs:
+        return
+
+    taken: set = set()
+    order = {"start": 0, "middle": 1, "end": 2}
+    for c in sorted(customs, key=lambda x: order.get(x["position"], 1)):
+        idxs: List[int] = []
+        acc = 0.0
+
+        if c["position"] == "end":
+            for i in range(len(scenes) - 1, -1, -1):
+                if i in taken:
+                    break
+                idxs.insert(0, i)
+                acc += float(scenes[i].get("duration", SEGMENT_MIN))
+                if acc >= c["duration"]:
+                    break
+        else:
+            if c["position"] == "start":
+                start = 0
+            else:
+                start = next((i for i, s in enumerate(scenes) if s.get("visual") == "screenshot"), None)
+                if start is None:
+                    start = max(0, len(scenes) // 2)
+            for i in range(start, len(scenes)):
+                if i in taken:
+                    break
+                idxs.append(i)
+                acc += float(scenes[i].get("duration", SEGMENT_MIN))
+                if acc >= c["duration"]:
+                    break
+
+        offset = 0.0
+        for i in idxs:
+            scenes[i]["custom_clip"] = c["path"]
+            scenes[i]["custom_offset"] = round(offset, 2)
+            scenes[i]["custom_total"] = c["duration"]
+            scenes[i]["image"] = None
+            scenes[i]["clip"] = None
+            offset += float(scenes[i].get("duration", SEGMENT_MIN))
+            taken.add(i)
+
+def make_custom_segment(clip_path: Path, output_path: Path, duration: float,
+                        offset: float, clip_total: float) -> bool:
+    """Cut `duration` seconds starting at `offset` so the recording plays continuously."""
+    vf = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,fps=30,setpts=PTS-STARTPTS,format=yuv420p"
+
+    if clip_total > 0 and offset + duration <= clip_total:
+        pre = ["-ss", str(round(offset, 2)), "-i", str(clip_path)]
+        post_ss: List[str] = []
+    else:
+        # recording is shorter than the narration it covers: loop it
+        pre = ["-stream_loop", "-1", "-i", str(clip_path)]
+        post_ss = ["-ss", str(round(offset, 2))]
+
+    cmd = ["ffmpeg", "-y"] + pre + post_ss + [
+        "-t", str(duration), "-an", "-vf", vf,
+        "-r", "30", "-vsync", "cfr", "-c:v", "libx264",
+        "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(output_path)
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 50000
 
 def detect_niche(data: Dict[str, Any]) -> str:
     text = " ".join([
@@ -715,7 +830,13 @@ def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_dur
         seg = segment_dir / f"seg_{i:03d}.mp4"
         made = False
 
-        if scene.get("image"):
+        if scene.get("custom_clip"):
+            made = make_custom_segment(
+                scene["custom_clip"], seg, duration,
+                float(scene.get("custom_offset", 0.0)),
+                float(scene.get("custom_total", 0.0))
+            )
+        elif scene.get("image"):
             make_image_segment(scene["image"], seg, duration=duration)
             made = seg.exists() and seg.stat().st_size > 50000
         elif scene.get("clip"):
