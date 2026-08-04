@@ -21,6 +21,9 @@ TEMP_DIR = BASE_DIR / "tmp"
 OUTPUT_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
+SEGMENT_MIN = 2.5      # shortest a single scene may be on screen
+SEGMENT_MAX = 9.0      # longest a single scene may be on screen
+
 app = FastAPI(title=APP_NAME)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
@@ -44,6 +47,12 @@ class GenerateRequest(BaseModel):
     cta: Optional[str] = ""
     screenshot_urls: Optional[List[str]] = []
     conversion_goal: Optional[str] = ""
+
+    # NEW: ordered scene plan from GPT.
+    # [{"text": "spoken line", "query": "pexels phrase", "visual": "broll"|"screenshot"}]
+    scenes: Optional[List[Dict[str, Any]]] = []
+    # NEW: AI conversion images are off by default (they are the biggest memory spike)
+    use_ai_images: bool = False
 
 @app.get("/")
 def home():
@@ -115,34 +124,39 @@ def run_generation(data: Dict[str, Any], job_id: str):
             voice_id=data["elevenlabs_voice"],
             output_path=audio_path
         )
+        audio_duration = max(10.0, get_duration(audio_path))
 
-        update_job(api_key, step="creating conversion images")
-        conversion_images = generate_conversion_images(data, niche, work)
+        conversion_images: List[Path] = []
+        if data.get("use_ai_images"):
+            update_job(api_key, step="creating conversion images")
+            conversion_images = generate_conversion_images(data, niche, work)
 
         update_job(api_key, step="capturing website screenshots")
         screenshots = capture_website_screenshots(data, work)
 
-        update_job(api_key, step="getting Pexels clips")
-        clips = download_pexels_clips(
-            query=data.get("search_query") or "business website laptop",
-            title=data.get("title", ""),
-            script=data.get("script", ""),
-            niche=niche,
+        update_job(api_key, step="planning scenes")
+        scenes = build_scene_plan(data, niche, audio_duration)
+        update_job(api_key, scene_count=len(scenes))
+
+        update_job(api_key, step="matching a clip to each scene")
+        scenes = attach_visuals(
+            scenes=scenes,
             pexels_key=data["pexels_key"],
             work_dir=work,
-            max_clips=32
+            screenshots=screenshots,
+            extra_images=conversion_images
         )
 
         update_job(api_key, step="creating captions")
         subtitles_path = work / "captions.srt"
-        make_simple_srt(data["script"], subtitles_path)
+        build_srt_from_scenes(scenes, subtitles_path)
 
         update_job(api_key, step="rendering final video")
         final_path = OUTPUT_DIR / f"{job_id}.mp4"
-        render_mixed_video(
-            clips=clips,
-            images=conversion_images + screenshots,
+        render_scene_video(
+            scenes=scenes,
             audio_path=audio_path,
+            audio_duration=audio_duration,
             subtitles_path=subtitles_path,
             output_path=final_path
         )
@@ -155,6 +169,223 @@ def run_generation(data: Dict[str, Any], job_id: str):
         update_job(api_key, status="error", step="failed", error=str(e))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+# ══════════════════════════════════════════════════════════════════
+# SCENE PLANNING
+# ══════════════════════════════════════════════════════════════════
+
+SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
+
+def split_script_into_chunks(script: str, target_words: int = 20) -> List[str]:
+    """Group sentences into chunks of roughly target_words each."""
+    sentences = [s.strip() for s in SENTENCE_SPLIT.split(script.replace("\n", " ")) if s.strip()]
+    chunks: List[str] = []
+    current: List[str] = []
+    count = 0
+    for s in sentences:
+        words = len(s.split())
+        current.append(s)
+        count += words
+        if count >= target_words:
+            chunks.append(" ".join(current))
+            current, count = [], 0
+    if current:
+        if chunks and count < 6:
+            chunks[-1] = chunks[-1] + " " + " ".join(current)
+        else:
+            chunks.append(" ".join(current))
+    return chunks or [script]
+
+def build_scene_plan(data: Dict[str, Any], niche: str, audio_duration: float) -> List[Dict[str, Any]]:
+    """
+    Returns an ordered list of scenes:
+      {"text": str, "query": str, "visual": "broll"|"screenshot", "duration": float}
+    Uses GPT's scene plan when present, otherwise derives one from the script.
+    """
+    raw_scenes = data.get("scenes") or []
+    scenes: List[Dict[str, Any]] = []
+
+    if raw_scenes:
+        for s in raw_scenes:
+            text = str(s.get("text") or "").strip()
+            query = str(s.get("query") or "").strip()
+            visual = str(s.get("visual") or "broll").strip().lower()
+            if not text:
+                continue
+            if visual not in ("broll", "screenshot"):
+                visual = "broll"
+            scenes.append({"text": text, "query": query, "visual": visual})
+
+    if not scenes:
+        # Fallback: chunk the script and rotate through the generic query list
+        fallback_queries = build_pexels_queries(
+            data.get("search_query") or "",
+            data.get("title", ""),
+            data.get("script", ""),
+            niche
+        )
+        chunks = split_script_into_chunks(data.get("script", ""))
+        for i, chunk in enumerate(chunks):
+            q = fallback_queries[i % len(fallback_queries)] if fallback_queries else "business office"
+            scenes.append({"text": chunk, "query": q, "visual": "broll"})
+
+    # Any scene missing a query falls back to keywords pulled from its own text
+    for s in scenes:
+        if not s["query"]:
+            s["query"] = keywords_from_text(s["text"], niche)
+
+    allocate_durations(scenes, audio_duration)
+    return scenes
+
+STOPWORDS = set("""
+a an the and or but if then than that this these those is are was were be been being am
+i you he she it we they me him her us them my your his its our their
+of in on at to for with from by about into over after before under as
+so very just really more most much many can will would should could do does did
+not no yes what when where who how why which
+""".split())
+
+def keywords_from_text(text: str, niche: str = "") -> str:
+    words = re.findall(r"[a-zA-Z]{4,}", text.lower())
+    keep = [w for w in words if w not in STOPWORDS]
+    if not keep:
+        return f"{niche} business" if niche else "business office"
+    return " ".join(keep[:3])
+
+def allocate_durations(scenes: List[Dict[str, Any]], audio_duration: float):
+    """Give each scene screen time proportional to how long its line takes to say."""
+    weights = [max(1, len(str(s.get("text", "")).split())) for s in scenes]
+    total = float(sum(weights)) or 1.0
+    for s, w in zip(scenes, weights):
+        d = audio_duration * (w / total)
+        s["duration"] = round(min(SEGMENT_MAX, max(SEGMENT_MIN, d)), 2)
+
+def build_srt_from_scenes(scenes: List[Dict[str, Any]], output_path: Path):
+    """Captions built from the same timeline as the visuals, so they stay in sync."""
+    def fmt(sec: float) -> str:
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        s = int(sec % 60)
+        ms = int(round((sec - int(sec)) * 1000))
+        return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+    lines: List[str] = []
+    idx = 1
+    t = 0.0
+    for scene in scenes:
+        dur = float(scene.get("duration", SEGMENT_MIN))
+        words = str(scene.get("text", "")).split()
+        if not words:
+            t += dur
+            continue
+        groups = [" ".join(words[i:i + 8]) for i in range(0, len(words), 8)]
+        per = dur / len(groups)
+        for g in groups:
+            start, end = t, t + per
+            lines.extend([str(idx), f"{fmt(start)} --> {fmt(end)}", g, ""])
+            idx += 1
+            t = end
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+# ══════════════════════════════════════════════════════════════════
+# VISUALS: one clip per scene, in order
+# ══════════════════════════════════════════════════════════════════
+
+def attach_visuals(scenes: List[Dict[str, Any]], pexels_key: str, work_dir: Path,
+                   screenshots: List[Path], extra_images: List[Path]) -> List[Dict[str, Any]]:
+    used_video_ids: set = set()
+    used_links: set = set()
+    shot_queue = list(screenshots)
+    image_queue = list(extra_images)
+    shot_i = 0
+    img_i = 0
+
+    for i, scene in enumerate(scenes):
+        scene["clip"] = None
+        scene["image"] = None
+
+        if scene["visual"] == "screenshot":
+            if shot_i < len(shot_queue):
+                scene["image"] = shot_queue[shot_i]
+                shot_i += 1
+                continue
+            if img_i < len(image_queue):
+                scene["image"] = image_queue[img_i]
+                img_i += 1
+                continue
+            scene["visual"] = "broll"  # nothing to show, fall back to b-roll
+
+        clip = download_clip_for_query(
+            query=scene["query"],
+            pexels_key=pexels_key,
+            work_dir=work_dir,
+            idx=i,
+            used_video_ids=used_video_ids,
+            used_links=used_links
+        )
+        scene["clip"] = clip
+
+    # Any screenshots GPT never asked for get dropped in at the end of the video
+    leftovers = shot_queue[shot_i:] + image_queue[img_i:]
+    if leftovers and scenes:
+        for j, extra in enumerate(reversed(leftovers)):
+            pos = len(scenes) - 2 - j
+            if pos < 1:
+                break
+            if scenes[pos]["visual"] == "broll":
+                scenes[pos]["visual"] = "screenshot"
+                scenes[pos]["image"] = extra
+                scenes[pos]["clip"] = None
+
+    return scenes
+
+def download_clip_for_query(query: str, pexels_key: str, work_dir: Path, idx: int,
+                            used_video_ids: set, used_links: set) -> Optional[Path]:
+    """Download ONE landscape clip that matches this scene's query."""
+    headers = {"Authorization": pexels_key}
+    attempts = [q for q in [query, " ".join(query.split()[:2]), query.split()[0] if query.split() else ""] if q]
+    attempts.append("business office technology")
+
+    for q in attempts:
+        for page in (1, 2):
+            params = {"query": q, "per_page": 10, "orientation": "landscape", "size": "medium", "page": page}
+            try:
+                r = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=40)
+                if r.status_code >= 400:
+                    continue
+                videos = r.json().get("videos", [])
+            except Exception:
+                continue
+
+            for video in videos:
+                vid = str(video.get("id", ""))
+                if vid and vid in used_video_ids:
+                    continue
+                link = pick_best_video_file(video.get("video_files", []))
+                if not link or link in used_links:
+                    continue
+
+                out = work_dir / f"scene_{idx:03d}_{vid or random.randint(1000, 9999)}.mp4"
+                try:
+                    with requests.get(link, stream=True, timeout=120) as resp:
+                        resp.raise_for_status()
+                        with open(out, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                    if out.exists() and out.stat().st_size > 100000:
+                        if vid:
+                            used_video_ids.add(vid)
+                        used_links.add(link)
+                        return out
+                    out.unlink(missing_ok=True)
+                except Exception:
+                    try:
+                        out.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue
+    return None
 
 def detect_niche(data: Dict[str, Any]) -> str:
     text = " ".join([
@@ -218,7 +449,7 @@ def generate_conversion_images(data: Dict[str, Any], niche: str, work_dir: Path)
     prompts = build_conversion_image_prompts(data, niche)
     image_paths: List[Path] = []
 
-    for i, prompt in enumerate(prompts[:5]):
+    for i, prompt in enumerate(prompts[:4]):
         out_raw = work_dir / f"conversion_{i}.png"
         out_jpg = work_dir / f"conversion_{i}.jpg"
 
@@ -246,7 +477,9 @@ def generate_conversion_images(data: Dict[str, Any], niche: str, work_dir: Path)
 
             import base64
             out_raw.write_bytes(base64.b64decode(b64))
+            del b64, data_json
             convert_image_to_video_frame(out_raw, out_jpg)
+            out_raw.unlink(missing_ok=True)
             if out_jpg.exists() and out_jpg.stat().st_size > 50000:
                 image_paths.append(out_jpg)
         except Exception:
@@ -272,7 +505,6 @@ def build_conversion_image_prompts(data: Dict[str, Any], niche: str) -> List[str
             base + f"Show a realistic Facebook business page/profile mockup on a phone or laptop with strong social proof, visible follower growth, active posts, likes, and engagement. Topic: {service}. Website: {website}.",
             base + "Create a before-and-after social proof scene: left side small empty Facebook page with low followers, right side trusted active Facebook page with more followers and better engagement. Use clear growth arrow, professional style.",
             base + "Create a safe order process visual for buying Facebook followers: show laptop checkout style, no password needed, safe growth, fast delivery, real followers. Do not show real private data.",
-            base + "Create a business owner looking happy while checking a growing Facebook page on smartphone, with notifications and follower growth visuals. Realistic, high trust, conversion focused.",
             base + f"Create a final CTA image for {website}: professional social media growth look, strong trust feeling, Facebook page growth, clear call-to-action mood. {cta}",
         ]
 
@@ -281,7 +513,6 @@ def build_conversion_image_prompts(data: Dict[str, Any], niche: str) -> List[str
             base + "Show premium 4K IPTV service visual: large smart TV with live sports channels, remote control, TV box, dark cinematic living room, 4K/UHD feeling.",
             base + "Show no buffering IPTV benefit: smooth live sports on TV, strong WiFi/streaming symbol, happy viewer, premium sports entertainment vibe.",
             base + "Show IPTV setup process: smart TV, app login screen, remote, simple steps, high quality streaming look. Avoid fake brand logos.",
-            base + "Show IPTV packages/checkout style on laptop or phone, safe subscription purchase, live TV and sports background, premium conversion image.",
             base + "Final CTA IPTV visual: sports, movies, live TV, 4K streaming, remote control, dark premium background, high trust feel.",
         ]
 
@@ -317,11 +548,16 @@ def build_conversion_image_prompts(data: Dict[str, Any], niche: str) -> List[str
     ]
 
 def capture_website_screenshots(data: Dict[str, Any], work_dir: Path) -> List[Path]:
+    """
+    Needs the WEBSITE_SCREENSHOT_API env var, e.g.
+      https://image.thum.io/get/width/1280/crop/720/{url_raw}
+    {url_raw} = plain URL,  {url} = percent-encoded URL.
+    """
     template = os.environ.get("WEBSITE_SCREENSHOT_API", "").strip()
     if not template:
         return []
 
-    urls = data.get("screenshot_urls") or []
+    urls = list(data.get("screenshot_urls") or [])
     website = data.get("website", "")
     if website:
         urls.insert(0, website)
@@ -338,9 +574,11 @@ def capture_website_screenshots(data: Dict[str, Any], work_dir: Path) -> List[Pa
             seen.add(u)
 
     paths = []
-    for i, url in enumerate(clean_urls[:4]):
+    for i, url in enumerate(clean_urls[:5]):
         try:
-            shot_url = template.replace("{url}", requests.utils.quote(url, safe=""))
+            shot_url = template.replace("{url_raw}", url).replace(
+                "{url}", requests.utils.quote(url, safe="")
+            )
             resp = requests.get(shot_url, timeout=90)
             if resp.status_code >= 400 or len(resp.content) < 10000:
                 continue
@@ -349,7 +587,8 @@ def capture_website_screenshots(data: Dict[str, Any], work_dir: Path) -> List[Pa
             jpg = work_dir / f"screenshot_{i}.jpg"
             raw.write_bytes(resp.content)
             convert_image_to_video_frame(raw, jpg)
-            if jpg.exists() and jpg.stat().st_size > 50000:
+            raw.unlink(missing_ok=True)
+            if jpg.exists() and jpg.stat().st_size > 30000:
                 paths.append(jpg)
         except Exception:
             continue
@@ -418,68 +657,9 @@ def pick_best_video_file(files: list) -> Optional[str]:
             return f["link"]
     return None
 
-def download_pexels_clips(query: str, title: str, script: str, niche: str, pexels_key: str, work_dir: Path, max_clips: int = 32) -> List[Path]:
-    headers = {"Authorization": pexels_key}
-    queries = build_pexels_queries(query, title, script, niche)
-
-    paths: List[Path] = []
-    used_video_ids = set()
-    used_links = set()
-    pages = [1, 2, 3, 4, 5]
-
-    for q in queries:
-        if len(paths) >= max_clips:
-            break
-        for page in pages:
-            if len(paths) >= max_clips:
-                break
-            params = {"query": q, "per_page": 12, "orientation": "landscape", "size": "medium", "page": page}
-            try:
-                r = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=45)
-                if r.status_code >= 400:
-                    continue
-                videos = r.json().get("videos", [])
-            except Exception:
-                continue
-
-            top = videos[:4]
-            rest = videos[4:]
-            random.shuffle(rest)
-            videos = top + rest
-
-            for video in videos:
-                if len(paths) >= max_clips:
-                    break
-                vid = str(video.get("id", ""))
-                if vid and vid in used_video_ids:
-                    continue
-                link = pick_best_video_file(video.get("video_files", []))
-                if not link or link in used_links:
-                    continue
-                out = work_dir / f"pexels_{len(paths):02d}_{vid or random.randint(1000,9999)}.mp4"
-                try:
-                    with requests.get(link, stream=True, timeout=120) as resp:
-                        resp.raise_for_status()
-                        with open(out, "wb") as f:
-                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                                if chunk:
-                                    f.write(chunk)
-                    if out.exists() and out.stat().st_size > 100000:
-                        paths.append(out)
-                        if vid:
-                            used_video_ids.add(vid)
-                        used_links.add(link)
-                except Exception:
-                    try:
-                        out.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    continue
-
-    return paths
-
-def create_color_video(output_path: Path, duration: int = 30) -> Path:
-    cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={duration}", "-pix_fmt", "yuv420p", str(output_path)]
+def create_color_video(output_path: Path, duration: float = 6.0) -> Path:
+    cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s=1280x720:d={duration}",
+           "-r", "30", "-pix_fmt", "yuv420p", str(output_path)]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return output_path
 
@@ -488,78 +668,75 @@ def get_duration(path: Path) -> float:
     out = subprocess.check_output(cmd).decode().strip()
     return float(out)
 
-def make_simple_srt(script: str, output_path: Path):
-    words = script.replace("\n", " ").split()
-    chunks = [" ".join(words[i:i+9]) for i in range(0, len(words), 9)]
-    def fmt(sec: float) -> str:
-        h = int(sec // 3600)
-        m = int((sec % 3600) // 60)
-        s = int(sec % 60)
-        ms = int((sec - int(sec)) * 1000)
-        return f"{h:02}:{m:02}:{s:02},{ms:03}"
-    lines = []
-    t = 0.0
-    for idx, chunk in enumerate(chunks[:400], start=1):
-        start = t
-        end = t + 3.5
-        lines.extend([str(idx), f"{fmt(start)} --> {fmt(end)}", chunk, ""])
-        t = end
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-
 def make_image_segment(image_path: Path, output_path: Path, duration: float = 6.0):
-    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,zoompan=z='min(zoom+0.0010,1.06)':d=180:s=1280x720:fps=30,format=yuv420p"
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(image_path), "-t", str(duration), "-vf", vf, "-an", "-r", "30", "-vsync", "cfr", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
+    frames = int(duration * 30) + 30
+    vf = ("scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,"
+          f"zoompan=z='min(zoom+0.0010,1.06)':d={frames}:s=1280x720:fps=30,format=yuv420p")
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(image_path), "-t", str(duration),
+           "-vf", vf, "-an", "-r", "30", "-vsync", "cfr", "-c:v", "libx264",
+           "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", str(output_path)]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
-def render_mixed_video(clips: List[Path], images: List[Path], audio_path: Path, subtitles_path: Path, output_path: Path):
-    audio_duration = max(10, get_duration(audio_path))
+def make_broll_segment(clip_path: Path, output_path: Path, duration: float) -> bool:
+    try:
+        clip_dur = get_duration(clip_path)
+    except Exception:
+        clip_dur = 0.0
+
+    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p"
+
+    if clip_dur > duration + 1.0:
+        start_at = random.uniform(0, max(0.0, clip_dur - duration - 0.5))
+        pre = ["-ss", str(round(start_at, 2)), "-i", str(clip_path)]
+    else:
+        # clip is shorter than the line being spoken: loop it instead of cutting away
+        pre = ["-stream_loop", "-1", "-i", str(clip_path)]
+
+    cmd = ["ffmpeg", "-y"] + pre + [
+        "-t", str(duration), "-an", "-vf", vf,
+        "-r", "30", "-vsync", "cfr", "-c:v", "libx264",
+        "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(output_path)
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 50000
+
+def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_duration: float,
+                       subtitles_path: Path, output_path: Path):
     segment_dir = TEMP_DIR / f"segments_{output_path.stem}"
     segment_dir.mkdir(exist_ok=True)
 
-    segment_duration = 6.0
-    needed_segments = int(audio_duration / segment_duration) + 2
     segment_paths: List[Path] = []
+    last_good: Optional[Path] = None
 
-    image_queue = images[:]
-    random.shuffle(image_queue)
-    pexels_queue = clips[:]
-    random.shuffle(pexels_queue)
-    img_i = 0
-    vid_i = 0
+    for i, scene in enumerate(scenes):
+        duration = float(scene.get("duration", SEGMENT_MIN))
+        seg = segment_dir / f"seg_{i:03d}.mp4"
+        made = False
 
-    for i in range(needed_segments):
-        use_image = bool(image_queue and (i in [0, 2, 5, needed_segments - 2] or i % 4 == 0))
-        if use_image and img_i < len(image_queue):
-            seg = segment_dir / f"img_{i:03d}.mp4"
-            make_image_segment(image_queue[img_i], seg, duration=segment_duration)
-            img_i += 1
-            if seg.exists() and seg.stat().st_size > 50000:
-                segment_paths.append(seg)
-                continue
+        if scene.get("image"):
+            make_image_segment(scene["image"], seg, duration=duration)
+            made = seg.exists() and seg.stat().st_size > 50000
+        elif scene.get("clip"):
+            made = make_broll_segment(scene["clip"], seg, duration)
 
-        if vid_i < len(pexels_queue):
-            clip = pexels_queue[vid_i]
-            vid_i += 1
-            try:
-                dur = get_duration(clip)
-            except Exception:
-                dur = segment_duration
-            start_at = random.uniform(0, max(0, dur - segment_duration - 0.5)) if dur > segment_duration + 1 else 0
-            seg = segment_dir / f"vid_{i:03d}.mp4"
-            cmd = ["ffmpeg", "-y", "-ss", str(start_at), "-i", str(clip), "-t", str(segment_duration), "-an", "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p", "-r", "30", "-vsync", "cfr", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(seg)]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode == 0 and seg.exists() and seg.stat().st_size > 50000:
-                segment_paths.append(seg)
-                continue
+        if not made and last_good is not None:
+            # reuse the previous scene's footage rather than showing a black gap
+            made = make_broll_segment(last_good, seg, duration)
 
-        fallback = segment_dir / f"fallback_{i:03d}.mp4"
-        create_color_video(fallback, duration=int(segment_duration))
-        segment_paths.append(fallback)
+        if not made:
+            create_color_video(seg, duration=duration)
+
+        segment_paths.append(seg)
+        if scene.get("clip"):
+            last_good = scene["clip"]
 
     concat_file = TEMP_DIR / f"concat_{output_path.stem}.txt"
     concat_file.write_text("\n".join([f"file '{p.as_posix()}'" for p in segment_paths]), encoding="utf-8")
     sub_path = subtitles_path.as_posix().replace(":", "\\:")
-    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p," + f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2'"
+    vf = ("scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p,"
+          + f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2'")
 
     cmd = [
         "ffmpeg", "-y",
@@ -590,6 +767,7 @@ def render_mixed_video(clips: List[Path], images: List[Path], audio_path: Path, 
         concat_file.unlink(missing_ok=True)
     except Exception:
         pass
+    shutil.rmtree(segment_dir, ignore_errors=True)
 
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode(errors="ignore")[-1200:])
