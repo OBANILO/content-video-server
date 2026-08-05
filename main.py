@@ -57,6 +57,10 @@ class GenerateRequest(BaseModel):
     # [{"url": "https://site/clip1.mp4", "position": "middle"|"end"}]
     custom_clips: Optional[List[Dict[str, Any]]] = []
 
+    # NEW: keeps stock footage inside the niche.
+    scene_anchor: str = ""                     # e.g. "television"
+    ban_terms: Optional[List[str]] = []        # e.g. ["instagram", "office meeting"]
+
 @app.get("/")
 def home():
     return {
@@ -141,13 +145,28 @@ def run_generation(data: Dict[str, Any], job_id: str):
         scenes = build_scene_plan(data, niche, audio_duration)
         update_job(api_key, scene_count=len(scenes))
 
+        # ✅ measure when each word is ACTUALLY spoken, instead of guessing from
+        # word counts. Without this the captions and the clips drift apart.
+        spoken_words: List[Dict[str, Any]] = []
+        if data.get("openai_key"):
+            update_job(api_key, step="listening back to the voiceover")
+            spoken_words = transcribe_words(audio_path, data["openai_key"])
+
+        if spoken_words:
+            scenes = align_scenes_to_audio(scenes, spoken_words, audio_duration)
+            update_job(api_key, aligned="whisper", scene_count=len(scenes))
+        else:
+            update_job(api_key, aligned="estimated")
+
         update_job(api_key, step="matching a clip to each scene")
         scenes = attach_visuals(
             scenes=scenes,
             pexels_key=data["pexels_key"],
             work_dir=work,
             screenshots=screenshots,
-            extra_images=conversion_images
+            extra_images=conversion_images,
+            anchor=str(data.get("scene_anchor") or ""),
+            ban_terms=[str(b).strip().lower() for b in (data.get("ban_terms") or []) if str(b).strip()]
         )
 
         if data.get("custom_clips"):
@@ -158,7 +177,10 @@ def run_generation(data: Dict[str, Any], job_id: str):
 
         update_job(api_key, step="creating captions")
         subtitles_path = work / "captions.srt"
-        build_srt_from_scenes(scenes, subtitles_path)
+        if spoken_words:
+            build_srt_from_words(spoken_words, subtitles_path)
+        else:
+            build_srt_from_scenes(scenes, subtitles_path)
 
         update_job(api_key, step="rendering final video")
         final_path = OUTPUT_DIR / f"{job_id}.mp4"
@@ -269,6 +291,131 @@ def allocate_durations(scenes: List[Dict[str, Any]], audio_duration: float):
         d = audio_duration * (w / total)
         s["duration"] = round(min(SEGMENT_MAX, max(SEGMENT_MIN, d)), 2)
 
+# ══════════════════════════════════════════════════════════════════
+# REAL TIMING — transcribe the voiceover and use its word timestamps
+# ══════════════════════════════════════════════════════════════════
+
+def transcribe_words(audio_path: Path, openai_key: str) -> List[Dict[str, Any]]:
+    """Whisper with word-level timestamps. Returns [] on any failure."""
+    try:
+        with open(audio_path, "rb") as fh:
+            r = requests.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {openai_key}"},
+                files={"file": ("voice.mp3", fh, "audio/mpeg")},
+                data={
+                    "model": "whisper-1",
+                    "response_format": "verbose_json",
+                    "timestamp_granularities[]": "word",
+                },
+                timeout=300,
+            )
+        if r.status_code >= 400:
+            return []
+        payload = r.json()
+    except Exception:
+        return []
+
+    words: List[Dict[str, Any]] = []
+    for w in payload.get("words", []) or []:
+        text = str(w.get("word") or "").strip()
+        start, end = w.get("start"), w.get("end")
+        if not text or start is None or end is None:
+            continue
+        start, end = float(start), float(end)
+        if end <= start:
+            continue
+        words.append({"word": text, "start": start, "end": end})
+
+    if words:
+        return words
+
+    # some responses only carry segments — better than nothing
+    for seg in payload.get("segments", []) or []:
+        text = str(seg.get("text") or "").strip()
+        start, end = seg.get("start"), seg.get("end")
+        if not text or start is None or end is None:
+            continue
+        words.append({"word": text, "start": float(start), "end": float(end)})
+
+    return words
+
+def align_scenes_to_audio(scenes: List[Dict[str, Any]], words: List[Dict[str, Any]],
+                          audio_duration: float) -> List[Dict[str, Any]]:
+    """
+    Give every scene the time its own line is actually spoken.
+    The transcript follows the script in order, so cumulative word position maps
+    across cleanly even when Whisper drops or merges the odd word.
+    """
+    if not scenes or not words:
+        return scenes
+
+    total_spoken = len(words)
+    counts = [max(1, len(str(s.get("text", "")).split())) for s in scenes]
+    total_script = float(sum(counts)) or 1.0
+
+    cursor = 0
+    for s, c in zip(scenes, counts):
+        start_i = min(total_spoken - 1, int(round(cursor * total_spoken / total_script)))
+        cursor += c
+        end_i = min(total_spoken - 1, int(round(cursor * total_spoken / total_script)) - 1)
+        if end_i < start_i:
+            end_i = start_i
+
+        s["start"] = round(words[start_i]["start"], 2)
+        s["end"] = round(words[end_i]["end"], 2)
+
+    # close gaps so one scene runs straight into the next
+    for i in range(len(scenes) - 1):
+        scenes[i]["end"] = scenes[i + 1]["start"]
+    scenes[0]["start"] = 0.0
+    scenes[-1]["end"] = max(scenes[-1]["end"], audio_duration)
+
+    # fold anything too short to register into its neighbour
+    merged: List[Dict[str, Any]] = []
+    for s in scenes:
+        dur = float(s["end"]) - float(s["start"])
+        if merged and dur < 1.6:
+            merged[-1]["end"] = s["end"]
+            merged[-1]["text"] = (merged[-1].get("text", "") + " " + s.get("text", "")).strip()
+            continue
+        merged.append(s)
+
+    for s in merged:
+        s["duration"] = round(max(1.0, float(s["end"]) - float(s["start"])), 2)
+
+    return merged
+
+def _srt_time(sec: float) -> str:
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000))
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_line: int = 7):
+    """Captions straight off the measured timings — they cannot drift."""
+    lines: List[str] = []
+    idx = 1
+
+    for i in range(0, len(words), per_line):
+        chunk = words[i:i + per_line]
+        if not chunk:
+            continue
+        text = " ".join(w["word"] for w in chunk).strip()
+        if not text:
+            continue
+
+        start = float(chunk[0]["start"])
+        end = float(chunk[-1]["end"])
+        if end <= start:
+            end = start + 0.6
+
+        lines.extend([str(idx), f"{_srt_time(start)} --> {_srt_time(end)}", text, ""])
+        idx += 1
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
 def build_srt_from_scenes(scenes: List[Dict[str, Any]], output_path: Path):
     """Captions built from the same timeline as the visuals, so they stay in sync."""
     def fmt(sec: float) -> str:
@@ -301,7 +448,9 @@ def build_srt_from_scenes(scenes: List[Dict[str, Any]], output_path: Path):
 # ══════════════════════════════════════════════════════════════════
 
 def attach_visuals(scenes: List[Dict[str, Any]], pexels_key: str, work_dir: Path,
-                   screenshots: List[Path], extra_images: List[Path]) -> List[Dict[str, Any]]:
+                   screenshots: List[Path], extra_images: List[Path],
+                   anchor: str = "", ban_terms: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    ban_terms = ban_terms or []
     used_video_ids: set = set()
     used_links: set = set()
     shot_queue = list(screenshots)
@@ -330,7 +479,9 @@ def attach_visuals(scenes: List[Dict[str, Any]], pexels_key: str, work_dir: Path
             work_dir=work_dir,
             idx=i,
             used_video_ids=used_video_ids,
-            used_links=used_links
+            used_links=used_links,
+            anchor=anchor,
+            ban_terms=ban_terms
         )
         scene["clip"] = clip
 
@@ -348,12 +499,35 @@ def attach_visuals(scenes: List[Dict[str, Any]], pexels_key: str, work_dir: Path
 
     return scenes
 
+def _clip_is_off_topic(video: Dict[str, Any], ban_terms: List[str]) -> bool:
+    """Pexels puts the description in the page URL slug — use it to reject junk."""
+    if not ban_terms:
+        return False
+    slug = str(video.get("url", "")).lower().replace("-", " ")
+    return any(b and b in slug for b in ban_terms)
+
 def download_clip_for_query(query: str, pexels_key: str, work_dir: Path, idx: int,
-                            used_video_ids: set, used_links: set) -> Optional[Path]:
-    """Download ONE landscape clip that matches this scene's query."""
+                            used_video_ids: set, used_links: set,
+                            anchor: str = "", ban_terms: Optional[List[str]] = None) -> Optional[Path]:
+    """Download ONE landscape clip that matches this scene's query, inside the niche."""
     headers = {"Authorization": pexels_key}
-    attempts = [q for q in [query, " ".join(query.split()[:2]), query.split()[0] if query.split() else ""] if q]
-    attempts.append("business office technology")
+    ban_terms = ban_terms or []
+    anchor = (anchor or "").strip()
+
+    words = query.split()
+    attempts: List[str] = []
+
+    # anchored first: "buffering wheel" alone drifts, "buffering wheel television" does not
+    if anchor and anchor.lower() not in query.lower():
+        attempts.append(f"{query} {anchor}")
+    attempts.append(query)
+    if len(words) > 2:
+        attempts.append(" ".join(words[:2]) + (f" {anchor}" if anchor else ""))
+    # last resort stays inside the niche instead of "business office technology"
+    attempts.append(anchor if anchor else "business office technology")
+
+    seen_q = set()
+    attempts = [q for q in attempts if q.strip() and not (q in seen_q or seen_q.add(q))]
 
     for q in attempts:
         for page in (1, 2):
@@ -369,6 +543,8 @@ def download_clip_for_query(query: str, pexels_key: str, work_dir: Path, idx: in
             for video in videos:
                 vid = str(video.get("id", ""))
                 if vid and vid in used_video_ids:
+                    continue
+                if _clip_is_off_topic(video, ban_terms):
                     continue
                 link = pick_best_video_file(video.get("video_files", []))
                 if not link or link in used_links:
