@@ -53,8 +53,9 @@ class GenerateRequest(BaseModel):
     scenes: Optional[List[Dict[str, Any]]] = []
     # NEW: AI conversion images are off by default (they are the biggest memory spike)
     use_ai_images: bool = False
-    # NEW: user-recorded screen captures.
-    # [{"url": "https://site/clip1.mp4", "position": "middle"|"end"}]
+    # NEW: user-recorded screen captures, in order.
+    # [{"url": "...", "label": "sign up", "position": "middle"|"end"|"auto"}]
+    # A scene whose "visual" is "clip1".."clip9" gets that recording.
     custom_clips: Optional[List[Dict[str, Any]]] = []
 
     # NEW: keeps stock footage inside the niche.
@@ -580,11 +581,12 @@ def download_custom_clips(clips: List[Dict[str, Any]], work_dir: Path) -> List[D
     out: List[Dict[str, Any]] = []
     for i, c in enumerate(clips or []):
         url = str((c or {}).get("url") or "").strip()
-        position = str((c or {}).get("position") or "middle").strip().lower()
+        position = str((c or {}).get("position") or "auto").strip().lower()
+        label = str((c or {}).get("label") or "").strip()
         if not url:
             continue
-        if position not in ("middle", "end", "start"):
-            position = "middle"
+        if position not in ("middle", "end", "start", "auto"):
+            position = "auto"
 
         dest = work_dir / f"custom_{i}.mp4"
         try:
@@ -606,25 +608,76 @@ def download_custom_clips(clips: List[Dict[str, Any]], work_dir: Path) -> List[D
         if dur <= 0.5:
             continue
 
-        out.append({"path": dest, "position": position, "duration": dur})
+        out.append({
+            "path": dest,
+            "position": position,
+            "label": label,
+            "duration": dur,
+            "slot": i + 1,          # matches a scene marked "clip1", "clip2", ...
+        })
     return out
+
+def _assign_clip(scenes: List[Dict[str, Any]], idxs: List[int], c: Dict[str, Any], taken: set):
+    """Play one recording continuously across a run of scenes."""
+    offset = 0.0
+    for i in idxs:
+        scenes[i]["custom_clip"] = c["path"]
+        scenes[i]["custom_offset"] = round(offset, 2)
+        scenes[i]["custom_total"] = c["duration"]
+        scenes[i]["image"] = None
+        scenes[i]["clip"] = None
+        offset += float(scenes[i].get("duration", SEGMENT_MIN))
+        taken.add(i)
 
 def place_custom_clips(scenes: List[Dict[str, Any]], customs: List[Dict[str, Any]]):
     """
     Lay each recording over a run of consecutive scenes so the voiceover keeps
     talking while the recording plays through from start to finish.
+
+    Preferred: the script marks scenes "clip1", "clip2", ... and each recording
+    lands exactly where it is being talked about. Anything unmarked falls back
+    to start / middle / end, then to an even spread.
     """
     if not scenes or not customs:
         return
 
     taken: set = set()
-    order = {"start": 0, "middle": 1, "end": 2}
-    for c in sorted(customs, key=lambda x: order.get(x["position"], 1)):
+    placed: set = set()
+
+    # ── 1. explicit marks from the script ─────────────────────────────
+    for c in customs:
+        mark = "clip%d" % int(c.get("slot", 0))
+        idxs = [i for i, s in enumerate(scenes)
+                if str(s.get("visual", "")).strip().lower() == mark and i not in taken]
+        if not idxs:
+            continue
+
+        # extend forward until the whole recording has played
+        acc = sum(float(scenes[i].get("duration", SEGMENT_MIN)) for i in idxs)
+        j = idxs[-1] + 1
+        while acc < c["duration"] and j < len(scenes) and j not in taken \
+                and not str(scenes[j].get("visual", "")).lower().startswith("clip"):
+            idxs.append(j)
+            acc += float(scenes[j].get("duration", SEGMENT_MIN))
+            j += 1
+
+        _assign_clip(scenes, idxs, c, taken)
+        placed.add(c["slot"])
+
+    # ── 2. whatever the script did not mark ───────────────────────────
+    leftovers = [c for c in customs if c["slot"] not in placed]
+    if not leftovers:
+        return
+
+    order = {"start": 0, "middle": 1, "auto": 1, "end": 2}
+    n = len(scenes)
+
+    for k, c in enumerate(sorted(leftovers, key=lambda x: order.get(x["position"], 1))):
         idxs: List[int] = []
         acc = 0.0
 
         if c["position"] == "end":
-            for i in range(len(scenes) - 1, -1, -1):
+            for i in range(n - 1, -1, -1):
                 if i in taken:
                     break
                 idxs.insert(0, i)
@@ -634,11 +687,18 @@ def place_custom_clips(scenes: List[Dict[str, Any]], customs: List[Dict[str, Any
         else:
             if c["position"] == "start":
                 start = 0
-            else:
+            elif c["position"] == "middle":
                 start = next((i for i, s in enumerate(scenes) if s.get("visual") == "screenshot"), None)
                 if start is None:
-                    start = max(0, len(scenes) // 2)
-            for i in range(start, len(scenes)):
+                    start = max(0, n // 2)
+            else:
+                # spread the unmarked ones evenly through the back half
+                start = min(n - 1, int(n * 0.45) + int(k * n * 0.5 / max(1, len(leftovers))))
+
+            while start < n and start in taken:
+                start += 1
+
+            for i in range(start, n):
                 if i in taken:
                     break
                 idxs.append(i)
@@ -646,15 +706,8 @@ def place_custom_clips(scenes: List[Dict[str, Any]], customs: List[Dict[str, Any
                 if acc >= c["duration"]:
                     break
 
-        offset = 0.0
-        for i in idxs:
-            scenes[i]["custom_clip"] = c["path"]
-            scenes[i]["custom_offset"] = round(offset, 2)
-            scenes[i]["custom_total"] = c["duration"]
-            scenes[i]["image"] = None
-            scenes[i]["clip"] = None
-            offset += float(scenes[i].get("duration", SEGMENT_MIN))
-            taken.add(i)
+        if idxs:
+            _assign_clip(scenes, idxs, c, taken)
 
 def make_custom_segment(clip_path: Path, output_path: Path, duration: float,
                         offset: float, clip_total: float) -> bool:
