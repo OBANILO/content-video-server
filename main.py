@@ -618,12 +618,20 @@ def download_custom_clips(clips: List[Dict[str, Any]], work_dir: Path) -> List[D
     return out
 
 def _assign_clip(scenes: List[Dict[str, Any]], idxs: List[int], c: Dict[str, Any], taken: set):
-    """Play one recording continuously across a run of scenes."""
+    """
+    Play one recording continuously across a run of scenes.
+    Stops handing out scenes once the recording has run out, so a short clip
+    never gets restarted from the top halfway through the video.
+    """
     offset = 0.0
+    total = float(c["duration"])
+
     for i in idxs:
+        if offset >= total - 0.4:      # nothing meaningful left to show
+            break
         scenes[i]["custom_clip"] = c["path"]
         scenes[i]["custom_offset"] = round(offset, 2)
-        scenes[i]["custom_total"] = c["duration"]
+        scenes[i]["custom_total"] = total
         scenes[i]["image"] = None
         scenes[i]["clip"] = None
         offset += float(scenes[i].get("duration", SEGMENT_MIN))
@@ -711,23 +719,33 @@ def place_custom_clips(scenes: List[Dict[str, Any]], customs: List[Dict[str, Any
 
 def make_custom_segment(clip_path: Path, output_path: Path, duration: float,
                         offset: float, clip_total: float) -> bool:
-    """Cut `duration` seconds starting at `offset` so the recording plays continuously."""
-    vf = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,fps=30,setpts=PTS-STARTPTS,format=yuv420p"
+    """
+    Cut `duration` seconds starting at `offset` so the recording plays through once.
 
-    if clip_total > 0 and offset + duration <= clip_total:
-        pre = ["-ss", str(round(offset, 2)), "-i", str(clip_path)]
-        post_ss: List[str] = []
+    When the narration outlasts the footage we HOLD THE LAST FRAME. Looping it
+    back to the beginning reads as a glitch — the viewer sees the demo restart
+    mid-sentence.
+    """
+    base_vf = ("scale=1280:720:force_original_aspect_ratio=decrease,"
+               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,"
+               "fps=30,setpts=PTS-STARTPTS,format=yuv420p")
+
+    available = max(0.0, float(clip_total) - float(offset)) if clip_total > 0 else 0.0
+
+    if clip_total <= 0 or available >= duration:
+        vf = base_vf
     else:
-        # recording is shorter than the narration it covers: loop it
-        pre = ["-stream_loop", "-1", "-i", str(clip_path)]
-        post_ss = ["-ss", str(round(offset, 2))]
+        # play what is left, then freeze the final frame for the remainder
+        pad = round(duration - available + 0.2, 2)
+        vf = base_vf + f",tpad=stop_mode=clone:stop_duration={pad}"
 
-    cmd = ["ffmpeg", "-y"] + pre + post_ss + [
-        "-t", str(duration), "-an", "-vf", vf,
-        "-r", "30", "-vsync", "cfr", "-c:v", "libx264",
-        "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", str(output_path)
-    ]
+    cmd = ["ffmpeg", "-y",
+           "-ss", str(round(offset, 2)), "-i", str(clip_path),
+           "-t", str(duration), "-an", "-vf", vf,
+           "-r", "30", "-vsync", "cfr", "-c:v", "libx264",
+           "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", str(output_path)]
+
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 50000
 
