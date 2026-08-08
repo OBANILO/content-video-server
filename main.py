@@ -62,6 +62,10 @@ class GenerateRequest(BaseModel):
     scene_anchor: str = ""                     # e.g. "television"
     ban_terms: Optional[List[str]] = []        # e.g. ["instagram", "office meeting"]
 
+    # NEW: spelling the voice gets wrong -> how to write it so it reads correctly.
+    # [{"from": "4kukiptv", "to": "four K U K I P T V"}]  — applied to the AUDIO only.
+    say_as: Optional[List[Dict[str, str]]] = []
+
 @app.get("/")
 def home():
     return {
@@ -126,8 +130,12 @@ def run_generation(data: Dict[str, Any], job_id: str):
 
         update_job(api_key, step="creating voiceover", niche=niche)
         audio_path = work / "voice.mp3"
+
+        # the voice gets a respelled copy; the captions keep your real spelling
+        spoken_text = apply_say_as(data["script"], data.get("say_as") or [])
+
         make_voiceover(
-            text=data["script"],
+            text=spoken_text,
             elevenlabs_key=data["elevenlabs_key"],
             voice_id=data["elevenlabs_voice"],
             output_path=audio_path
@@ -179,7 +187,10 @@ def run_generation(data: Dict[str, Any], job_id: str):
 
         update_job(api_key, step="creating captions")
         subtitles_path = work / "captions.srt"
-        if spoken_words:
+        if spoken_words and all("start" in s and "end" in s for s in scenes):
+            # your script's spelling, on the measured timeline
+            build_srt_from_aligned_scenes(scenes, subtitles_path)
+        elif spoken_words:
             build_srt_from_words(spoken_words, subtitles_path)
         else:
             build_srt_from_scenes(scenes, subtitles_path)
@@ -395,6 +406,63 @@ def _srt_time(sec: float) -> str:
     s = int(sec % 60)
     ms = int(round((sec - int(sec)) * 1000))
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def apply_say_as(text: str, rules: List[Dict[str, str]]) -> str:
+    """
+    Respell words the voice mangles, for the AUDIO ONLY.
+    "4kukiptv" is read as "4QKeepTV"; feed the voice "four K U K I P T V"
+    while the captions keep the real spelling.
+    """
+    out = str(text or "")
+    for r in rules or []:
+        frm = str((r or {}).get("from") or "").strip()
+        to = str((r or {}).get("to") or "").strip()
+        if not frm or not to:
+            continue
+        out = re.sub(re.escape(frm), to, out, flags=re.IGNORECASE)
+    return out
+
+def build_srt_from_aligned_scenes(scenes: List[Dict[str, Any]], output_path: Path, per_line: int = 7):
+    """
+    Captions taken from YOUR script text, placed on the measured timeline.
+
+    build_srt_from_words() uses Whisper's transcript, which shows what the voice
+    actually said — so a mispronounced brand ends up misspelled on screen. This
+    keeps your spelling and still lands on the real timings, because each scene's
+    window was measured from the audio.
+    """
+    lines: List[str] = []
+    idx = 1
+
+    for scene in scenes:
+        text = str(scene.get("text", "")).strip()
+        if not text:
+            continue
+
+        start = float(scene.get("start", 0.0))
+        end = float(scene.get("end", start + float(scene.get("duration", SEGMENT_MIN))))
+        span = max(0.4, end - start)
+
+        words = text.split()
+        groups = [words[i:i + per_line] for i in range(0, len(words), per_line)]
+        if not groups:
+            continue
+
+        # share the scene's window out by word count
+        weights = [len(g) for g in groups]
+        total = float(sum(weights)) or 1.0
+
+        t = start
+        for g, w in zip(groups, weights):
+            seg = span * (w / total)
+            s0, s1 = t, min(end, t + seg)
+            if s1 <= s0:
+                s1 = s0 + 0.35
+            lines.extend([str(idx), f"{_srt_time(s0)} --> {_srt_time(s1)}", " ".join(g), ""])
+            idx += 1
+            t = s1
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
 
 def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_line: int = 7):
     """Captions straight off the measured timings — they cannot drift."""
@@ -638,14 +706,20 @@ def _assign_clip(scenes: List[Dict[str, Any]], idxs: List[int], c: Dict[str, Any
     total = float(c["duration"])
 
     for i in idxs:
-        if offset >= total - 0.4:      # nothing meaningful left to show
+        need = float(scenes[i].get("duration", SEGMENT_MIN))
+
+        # ✅ only take a scene this recording can fill completely.
+        # A partial scene meant freezing the last frame, which looks like the
+        # video hung. Let it end on a clean cut and give the scene to something else.
+        if total - offset < need:
             break
+
         scenes[i]["custom_clip"] = c["path"]
         scenes[i]["custom_offset"] = round(offset, 2)
         scenes[i]["custom_total"] = total
         scenes[i]["image"] = None
         scenes[i]["clip"] = None
-        offset += float(scenes[i].get("duration", SEGMENT_MIN))
+        offset += need
         taken.add(i)
 
 def place_custom_clips(scenes: List[Dict[str, Any]], customs: List[Dict[str, Any]]):
@@ -1084,10 +1158,24 @@ def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_dur
     segment_paths: List[Path] = []
     last_good: Optional[Path] = None
 
-    # ✅ when Pexels has nothing usable, your own recordings fill the gap —
-    # far better than dropping in unrelated stock footage
+    # your own recordings, reused for as long as the video needs them
     own = [c for c in (fallback_clips or []) if c.get("path")]
     own_i = 0
+    alternate = 0      # counts plain b-roll scenes, to swap stock / yours
+
+    def own_segment(seg_path: Path, want: float) -> bool:
+        """Next recording in the rotation, started far enough back to fill `want`."""
+        nonlocal own_i
+        for _ in range(len(own)):
+            c = own[own_i % len(own)]
+            own_i += 1
+            dur = float(c.get("duration", 0.0))
+            if dur <= 0:
+                continue
+            start = 0.0 if dur <= want else round(random.uniform(0, dur - want), 2)
+            if make_custom_segment(c["path"], seg_path, want, start, dur):
+                return True
+        return False
 
     for i, scene in enumerate(scenes):
         duration = float(scene.get("duration", SEGMENT_MIN))
@@ -1103,16 +1191,22 @@ def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_dur
         elif scene.get("image"):
             make_image_segment(scene["image"], seg, duration=duration)
             made = seg.exists() and seg.stat().st_size > 50000
-        elif scene.get("clip"):
-            made = make_broll_segment(scene["clip"], seg, duration)
+        else:
+            # ✅ plain b-roll scene: alternate one stock clip, then one of yours
+            alternate += 1
+            mine_turn = bool(own) and (alternate % 2 == 0)
 
-        # 1st fallback: one of your own recordings, cycled
-        if not made and own:
-            c = own[own_i % len(own)]
-            own_i += 1
-            made = make_custom_segment(c["path"], seg, duration, 0.0, float(c.get("duration", 0.0)))
+            if mine_turn:
+                made = own_segment(seg, duration)
+                if not made and scene.get("clip"):
+                    made = make_broll_segment(scene["clip"], seg, duration)
+            else:
+                if scene.get("clip"):
+                    made = make_broll_segment(scene["clip"], seg, duration)
+                if not made:
+                    made = own_segment(seg, duration)
 
-        # 2nd fallback: repeat the last footage that worked
+        # last resort before black: repeat the footage that worked previously
         if not made and last_good is not None:
             made = make_broll_segment(last_good, seg, duration)
 
