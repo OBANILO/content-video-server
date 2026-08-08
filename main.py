@@ -170,6 +170,7 @@ def run_generation(data: Dict[str, Any], job_id: str):
             ban_terms=[str(b).strip().lower() for b in (data.get("ban_terms") or []) if str(b).strip()]
         )
 
+        customs: List[Dict[str, Any]] = []
         if data.get("custom_clips"):
             update_job(api_key, step="adding your recorded clips")
             customs = download_custom_clips(data["custom_clips"], work)
@@ -190,7 +191,8 @@ def run_generation(data: Dict[str, Any], job_id: str):
             audio_path=audio_path,
             audio_duration=audio_duration,
             subtitles_path=subtitles_path,
-            output_path=final_path
+            output_path=final_path,
+            fallback_clips=customs
         )
 
         public_base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
@@ -399,8 +401,9 @@ def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_lin
     lines: List[str] = []
     idx = 1
 
-    for i in range(0, len(words), per_line):
-        chunk = words[i:i + per_line]
+    groups = [words[i:i + per_line] for i in range(0, len(words), per_line)]
+
+    for gi, chunk in enumerate(groups):
         if not chunk:
             continue
         text = " ".join(w["word"] for w in chunk).strip()
@@ -409,6 +412,14 @@ def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_lin
 
         start = float(chunk[0]["start"])
         end = float(chunk[-1]["end"])
+
+        # ✅ never overlap the next caption. Two overlapping lines render on top
+        # of each other and words appear to vanish mid-sentence.
+        if gi + 1 < len(groups) and groups[gi + 1]:
+            nxt = float(groups[gi + 1][0]["start"])
+            if end >= nxt:
+                end = max(start + 0.35, nxt - 0.03)
+
         if end <= start:
             end = start + 0.6
 
@@ -1065,12 +1076,18 @@ def make_broll_segment(clip_path: Path, output_path: Path, duration: float) -> b
     return res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 50000
 
 def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_duration: float,
-                       subtitles_path: Path, output_path: Path):
+                       subtitles_path: Path, output_path: Path,
+                       fallback_clips: Optional[List[Dict[str, Any]]] = None):
     segment_dir = TEMP_DIR / f"segments_{output_path.stem}"
     segment_dir.mkdir(exist_ok=True)
 
     segment_paths: List[Path] = []
     last_good: Optional[Path] = None
+
+    # ✅ when Pexels has nothing usable, your own recordings fill the gap —
+    # far better than dropping in unrelated stock footage
+    own = [c for c in (fallback_clips or []) if c.get("path")]
+    own_i = 0
 
     for i, scene in enumerate(scenes):
         duration = float(scene.get("duration", SEGMENT_MIN))
@@ -1089,8 +1106,14 @@ def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_dur
         elif scene.get("clip"):
             made = make_broll_segment(scene["clip"], seg, duration)
 
+        # 1st fallback: one of your own recordings, cycled
+        if not made and own:
+            c = own[own_i % len(own)]
+            own_i += 1
+            made = make_custom_segment(c["path"], seg, duration, 0.0, float(c.get("duration", 0.0)))
+
+        # 2nd fallback: repeat the last footage that worked
         if not made and last_good is not None:
-            # reuse the previous scene's footage rather than showing a black gap
             made = make_broll_segment(last_good, seg, duration)
 
         if not made:
@@ -1105,6 +1128,19 @@ def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_dur
     sub_path = subtitles_path.as_posix().replace(":", "\\:")
     vf = ("scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p,"
           + f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2'")
+
+    # ✅ if the assembled video is even slightly shorter than the voiceover,
+    # "-shortest" would cut the audio off mid-sentence. Hold the last frame
+    # instead, and let "-t audio_duration" decide the length.
+    video_len = 0.0
+    for p in segment_paths:
+        try:
+            video_len += get_duration(p)
+        except Exception:
+            pass
+
+    tail = max(0.0, audio_duration - video_len) + 1.0
+    vf = vf + f",tpad=stop_mode=clone:stop_duration={round(tail, 2)}"
 
     cmd = [
         "ffmpeg", "-y",
@@ -1127,7 +1163,6 @@ def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_dur
         "-ac", "2",
         "-af", "aresample=async=1:first_pts=0",
         "-movflags", "+faststart",
-        "-shortest",
         str(output_path)
     ]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
