@@ -115,6 +115,240 @@ def status(api_key: str):
 
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
+# ══════════════════════════════════════════════════════════════════
+# SHORTS — cut a vertical clip out of a finished long video
+# ══════════════════════════════════════════════════════════════════
+
+SHORT_SRC: Dict[str, str] = {}          # api_key -> downloaded source file
+SHORT_MIN, SHORT_MAX = 24.0, 36.0       # window length we aim for
+
+class ShortScanRequest(BaseModel):
+    api_key: str
+    video_url: str
+    openai_key: str = ""
+
+class ShortRenderRequest(BaseModel):
+    api_key: str
+    video_url: str = ""
+    start: float
+    end: float
+    mode: str = "fit"        # fit = blurred background, crop = fill and cut sides
+
+@app.post("/short-scan")
+def short_scan(req: ShortScanRequest, background_tasks: BackgroundTasks):
+    if not req.api_key:
+        raise HTTPException(status_code=400, detail="api_key missing")
+    if not req.video_url:
+        raise HTTPException(status_code=400, detail="video_url missing")
+
+    JOBS[req.api_key] = {
+        "job_id": str(uuid.uuid4()),
+        "status": "processing",
+        "step": "downloading the video",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "windows": [],
+        "error": "",
+        "kind": "short-scan",
+    }
+    background_tasks.add_task(run_short_scan, req.model_dump())
+    return {"ok": True, "status": "processing"}
+
+@app.post("/short-render")
+def short_render(req: ShortRenderRequest, background_tasks: BackgroundTasks):
+    if not req.api_key:
+        raise HTTPException(status_code=400, detail="api_key missing")
+    if req.end <= req.start:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    JOBS[req.api_key] = {
+        "job_id": str(uuid.uuid4()),
+        "status": "processing",
+        "step": "cutting the short",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "video_url": "",
+        "error": "",
+        "kind": "short-render",
+    }
+    background_tasks.add_task(run_short_render, req.model_dump())
+    return {"ok": True, "status": "processing"}
+
+def _fetch_video(url: str, dest: Path) -> bool:
+    try:
+        with requests.get(url, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+    except Exception:
+        return False
+    return dest.exists() and dest.stat().st_size > 100000
+
+def run_short_scan(data: Dict[str, Any]):
+    api_key = data["api_key"]
+    work = TEMP_DIR / ("short_" + re.sub(r"[^A-Za-z0-9]", "", api_key)[:24])
+    work.mkdir(parents=True, exist_ok=True)
+    src = work / "source.mp4"
+
+    try:
+        if not _fetch_video(data["video_url"], src):
+            update_job(api_key, status="error", step="failed", error="could not download that video")
+            return
+        SHORT_SRC[api_key] = str(src)
+
+        total = get_duration(src)
+        update_job(api_key, step="listening to the video", source_duration=round(total, 1))
+
+        words = transcribe_words(src, data.get("openai_key", "")) if data.get("openai_key") else []
+        if not words:
+            # no transcript: offer the opening and the middle
+            wins = [
+                {"start": 0.0, "end": min(SHORT_MAX, total), "text": "the opening", "why": "hook"},
+                {"start": max(0.0, total / 2 - 15), "end": min(total, total / 2 + 15),
+                 "text": "the middle", "why": "midpoint"},
+            ]
+        else:
+            wins = pick_short_windows(words, total)
+
+        update_job(api_key, status="completed", step="done", windows=wins)
+
+    except Exception as e:
+        update_job(api_key, status="error", step="failed", error=str(e))
+
+def pick_short_windows(words: List[Dict[str, Any]], total: float) -> List[Dict[str, Any]]:
+    """
+    Score every sentence as a possible opening line, then extend to ~30s.
+    Lines that point at the screen or name the product win, because those are
+    the moments that actually sell.
+    """
+    sentences: List[Dict[str, Any]] = []
+    buf: List[Dict[str, Any]] = []
+    for w in words:
+        buf.append(w)
+        if w["word"].strip().endswith((".", "!", "?")):
+            sentences.append({"start": buf[0]["start"], "end": buf[-1]["end"],
+                              "text": " ".join(x["word"] for x in buf).strip()})
+            buf = []
+    if buf:
+        sentences.append({"start": buf[0]["start"], "end": buf[-1]["end"],
+                          "text": " ".join(x["word"] for x in buf).strip()})
+    if not sentences:
+        return [{"start": 0.0, "end": min(SHORT_MAX, total), "text": "the opening", "why": "hook"}]
+
+    demo = ("look", "here", "on the screen", "watch this", "right here", "quality",
+            "picture", "plans", "checkout", "subscribe", "this is the one")
+    proof = ("i tested", "i tried", "i switched", "i got", "no buffering", "instant", "works on")
+
+    scored = []
+    for i, s in enumerate(sentences):
+        t = s["text"].lower()
+        score = 0
+        score += 3 * sum(1 for k in demo if k in t)
+        score += 2 * sum(1 for k in proof if k in t)
+        if i == 0:
+            score += 4                      # the hook is always a candidate
+        if s["start"] > total - SHORT_MIN:
+            score -= 5                      # too close to the end to fill a window
+        scored.append((score, i, s))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    out: List[Dict[str, Any]] = []
+    used_starts: List[float] = []
+
+    for score, i, s in scored:
+        start = float(s["start"])
+        if any(abs(start - u) < 12 for u in used_starts):
+            continue
+
+        end = start
+        for j in range(i, len(sentences)):
+            end = float(sentences[j]["end"])
+            if end - start >= SHORT_MIN:
+                break
+        if end - start > SHORT_MAX:
+            end = start + SHORT_MAX
+        if end - start < 8:
+            continue
+
+        text = " ".join(x["text"] for x in sentences[i:i + 6])
+        out.append({
+            "start": round(start, 2),
+            "end": round(min(end, total), 2),
+            "text": text[:220],
+            "why": "hook" if i == 0 else "demo",
+        })
+        used_starts.append(start)
+        if len(out) >= 3:
+            break
+
+    return out
+
+def run_short_render(data: Dict[str, Any]):
+    api_key = data["api_key"]
+    work = TEMP_DIR / ("short_" + re.sub(r"[^A-Za-z0-9]", "", api_key)[:24])
+    work.mkdir(parents=True, exist_ok=True)
+
+    try:
+        src = Path(SHORT_SRC.get(api_key, ""))
+        if not src.exists():
+            if not data.get("video_url"):
+                update_job(api_key, status="error", step="failed", error="source video is gone, send it again")
+                return
+            src = work / "source.mp4"
+            if not _fetch_video(data["video_url"], src):
+                update_job(api_key, status="error", step="failed", error="could not download that video")
+                return
+            SHORT_SRC[api_key] = str(src)
+
+        start = float(data["start"])
+        length = max(5.0, float(data["end"]) - start)
+
+        out = OUTPUT_DIR / f"short_{uuid.uuid4()}.mp4"
+        update_job(api_key, step="rendering vertical")
+
+        if str(data.get("mode", "fit")) == "crop":
+            # fills the screen, cuts the sides off
+            filt = ["-vf", "scale=1080:1920:force_original_aspect_ratio=increase,"
+                           "crop=1080:1920,format=yuv420p"]
+            maps = []
+        else:
+            # full frame centred, a blurred copy of itself filling top and bottom.
+            # Output is labelled so audio can be mapped explicitly — an unlabelled
+            # filter_complex drops the audio track.
+            filt = ["-filter_complex",
+                    "[0:v]split=2[bg][fg];"
+                    "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+                    "crop=1080:1920,boxblur=42:2,eq=brightness=-0.06[bgb];"
+                    "[fg]scale=1080:-2[fgs];"
+                    "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"]
+            maps = ["-map", "[v]", "-map", "0:a?"]
+
+        cmd = (["ffmpeg", "-y",
+                "-ss", str(round(start, 2)), "-i", str(src),
+                "-t", str(round(length, 2))]
+               + filt + maps
+               + ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                  "-pix_fmt", "yuv420p",
+                  "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
+                  "-movflags", "+faststart", str(out)])
+
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0 or not out.exists() or out.stat().st_size < 50000:
+            update_job(api_key, status="error", step="failed",
+                       error=res.stderr.decode(errors="ignore")[-600:])
+            return
+
+        public_base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
+        url = (public_base.rstrip("/") + f"/outputs/{out.name}") if public_base else f"/outputs/{out.name}"
+        update_job(api_key, status="completed", step="done", video_url=url,
+                   short_length=round(length, 1))
+
+    except Exception as e:
+        update_job(api_key, status="error", step="failed", error=str(e))
+
 def update_job(api_key: str, **kwargs):
     if api_key in JOBS:
         JOBS[api_key].update(kwargs)
