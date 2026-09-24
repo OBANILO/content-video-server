@@ -1,7 +1,8 @@
 FROM python:3.11-slim
 
+# fonts-liberation + fonts-freefont-ttf are for the song videos (serif lyrics, gold italic artist name)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg fonts-dejavu-core \
+    ffmpeg fonts-dejavu-core fonts-dejavu fonts-liberation fonts-freefont-ttf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -9,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py song.py ./
 
 RUN mkdir -p /app/outputs /app/tmp
 
