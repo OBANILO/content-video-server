@@ -115,6 +115,10 @@ def status(api_key: str):
 
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
+# song videos (the old video-generator-server) live under /song/...
+from song import router as song_router
+app.include_router(song_router)
+
 # ══════════════════════════════════════════════════════════════════
 # SHORTS — cut a vertical clip out of a finished long video
 # ══════════════════════════════════════════════════════════════════
@@ -491,7 +495,7 @@ def build_scene_plan(data: Dict[str, Any], niche: str, audio_duration: float) ->
             visual = str(s.get("visual") or "broll").strip().lower()
             if not text:
                 continue
-            if visual not in ("broll", "screenshot"):
+            if visual not in ("broll", "screenshot") and not re.fullmatch(r"clip\d{1,2}", visual):
                 visual = "broll"
             scenes.append({"text": text, "query": query, "visual": visual})
 
