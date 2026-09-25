@@ -242,6 +242,99 @@ def generate_video_job(job_id, image_path, audio_path, output_path, lyrics_segme
     except Exception as e:
         SONG_JOBS[job_id]['status']='error'; SONG_JOBS[job_id]['error']=str(e)
 
+# ══════════════════════════════════════════════════════════════════
+# CHAPTERS — where each lyric section (Verse 1, Chorus...) starts in the audio
+# YouTube only shows chapters when: first is 0:00, at least 3, each >= 10s.
+# ══════════════════════════════════════════════════════════════════
+
+CHAPTER_MIN_GAP = 10.0
+
+def _section_name(label):
+    s = re.sub(r'[\[\]\(\):]', '', label).strip()
+    return s.title() if s else 'Part'
+
+def parse_lyric_sections(text):
+    """[{'name': 'Verse 1', 'lines': [...]}, ...] in song order."""
+    sections = []
+    current = None
+    for raw in (text or '').replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        line = raw.strip()
+        if not line:
+            continue
+        if is_section_label(line):
+            current = {'name': _section_name(line), 'lines': []}
+            sections.append(current)
+            continue
+        if current is None:
+            current = {'name': 'Verse 1', 'lines': []}
+            sections.append(current)
+        current['lines'].append(line)
+    return [s for s in sections if s['lines']]
+
+def _find_line_start(words, line, cursor):
+    """Time the first words of `line` are sung, searching forward from `cursor`."""
+    target = [normalize_word(w) for w in line.split() if normalize_word(w)][:4]
+    if not target:
+        return None, cursor
+    norms = [w['norm'] for w in words]
+    need = min(3, len(target))
+    for i in range(cursor, len(norms)):
+        hits = sum(1 for k in range(len(target)) if i + k < len(norms) and norms[i + k] == target[k])
+        if hits >= need:
+            return float(words[i]['start']), i + 1
+    return None, cursor
+
+def build_chapters(lyrics_text, words, total):
+    sections = parse_lyric_sections(lyrics_text)
+    if not sections or total < CHAPTER_MIN_GAP * 3:
+        return []
+
+    # unique names — the last chorus reads better as "Final Chorus"
+    counts = {}
+    for s in sections:
+        counts[s['name']] = counts.get(s['name'], 0) + 1
+    seen = {}
+    for s in sections:
+        n = s['name']; seen[n] = seen.get(n, 0) + 1
+        if counts[n] > 1 and n.lower() == 'chorus' and seen[n] == counts[n]:
+            s['name'] = 'Final Chorus'
+
+    starts = []
+    if words:
+        cursor = 0
+        for s in sections:
+            t, cursor = _find_line_start(words, s['lines'][0], cursor)
+            starts.append(t)
+
+    # sections the transcript could not place get a share of the time by line count
+    if not starts or sum(1 for t in starts if t is not None) < 2:
+        lines = [len(s['lines']) for s in sections]
+        acc, whole = 0.0, float(sum(lines)) or 1.0
+        starts = []
+        for n in lines:
+            starts.append(total * acc / whole); acc += n
+    else:
+        for i, t in enumerate(starts):
+            if t is None:
+                prev = next((starts[j] for j in range(i - 1, -1, -1) if starts[j] is not None), 0.0)
+                nxt = next((starts[j] for j in range(i + 1, len(starts)) if starts[j] is not None), total)
+                starts[i] = (prev + nxt) / 2.0
+
+    chapters = []
+    if starts[0] >= CHAPTER_MIN_GAP:
+        chapters.append({'t': 0.0, 'name': 'Intro'})
+    for s, t in zip(sections, starts):
+        t = 0.0 if not chapters else max(0.0, float(t))
+        if chapters and t - chapters[-1]['t'] < CHAPTER_MIN_GAP:
+            continue
+        if total - t < CHAPTER_MIN_GAP:
+            break
+        chapters.append({'t': round(t, 1), 'name': s['name']})
+
+    if chapters:
+        chapters[0]['t'] = 0.0
+    return chapters if len(chapters) >= 3 else []
+
 def public_base(request: Request) -> str:
     # behind Render's proxy request.base_url comes back as http://, so prefer
     # the service's own https address when Render provides it
@@ -267,13 +360,21 @@ async def song_generate(request: Request):
                 if os.path.exists(f): os.remove(f)
             SONG_JOBS[job_id]['status']='downloading_assets'
             download_file(image_url,image_path); download_file(audio_url,audio_path)
-            lyrics_segments=[]
+            lyrics_segments=[]; words=[]
             if openai_key:
                 try:
                     SONG_JOBS[job_id]['status']='transcribing_lyrics'
-                    lyrics_segments=transcribe_lyrics_with_whisper(audio_path,openai_key,lyrics_text)
+                    words=transcribe_audio_words_with_whisper(audio_path,openai_key)
+                    lyrics_segments=build_lines_from_words(words)
                 except Exception as e:
                     print(f"[Lyrics] Whisper failed: {e}"); lyrics_segments=[]
+            # YouTube chapters from the real audio, handed back through /song/status
+            try:
+                total=get_audio_duration(audio_path)
+                SONG_JOBS[job_id]['duration']=round(total,1)
+                SONG_JOBS[job_id]['chapters']=build_chapters(lyrics_text,words,total)
+            except Exception as e:
+                print(f"[Chapters] {e}")
             if not lyrics_segments and lyrics_text:
                 duration=get_audio_duration(audio_path); lines=split_lyrics_lines(lyrics_text)
                 if lines:
@@ -292,6 +393,8 @@ def song_status(api_key: str, request: Request):
     if not job: return {'status':'not_found'}
     response={'status':job['status']}
     if job['status']=='completed': response['video_url']=public_base(request)+f'/song/videos/{api_key}/{api_key}.mp4'
+    if 'chapters' in job: response['chapters']=job['chapters']
+    if 'duration' in job: response['duration']=job['duration']
     if job.get('error'): response['error']=job['error']
     return response
 
