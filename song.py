@@ -89,11 +89,16 @@ def split_lyrics_lines(text):
 def normalize_word(w):
     return re.sub(r"[^\w']","",(w or "").lower()).strip()
 
-def transcribe_audio_words_with_whisper(audio_path, openai_api_key):
+def transcribe_audio_words_with_whisper(audio_path, openai_api_key, lyrics_text=""):
     if not openai_api_key or not os.path.exists(audio_path): return []
+    # language is forced: with music under the voice Whisper guessed Sinhala and the
+    # captions came out in Sinhala script. The start of the lyrics is passed as a hint.
+    hint = " ".join(split_lyrics_lines(lyrics_text))[:600]
+    form = {"model":"whisper-1","response_format":"verbose_json","timestamp_granularities[]":"word","language":"en"}
+    if hint: form["prompt"] = hint
     try:
         with open(audio_path,"rb") as audio_file:
-            response = requests.post("https://api.openai.com/v1/audio/transcriptions",headers={"Authorization":f"Bearer {openai_api_key}"},files={"file":audio_file},data={"model":"whisper-1","response_format":"verbose_json","timestamp_granularities[]":"word"},timeout=300)
+            response = requests.post("https://api.openai.com/v1/audio/transcriptions",headers={"Authorization":f"Bearer {openai_api_key}"},files={"file":audio_file},data=form,timeout=300)
         if response.status_code != 200: return []
         data = response.json()
         cleaned = []
@@ -277,7 +282,8 @@ def _find_line_start(words, line, cursor):
     if not target:
         return None, cursor
     norms = [w['norm'] for w in words]
-    need = min(3, len(target))
+    # 2 of the first 4 words is enough: sung audio is often misheard ("love" -> "glove", "2" -> "two")
+    need = min(2, len(target))
     for i in range(cursor, len(norms)):
         hits = sum(1 for k in range(len(target)) if i + k < len(norms) and norms[i + k] == target[k])
         if hits >= need:
@@ -335,6 +341,67 @@ def build_chapters(lyrics_text, words, total):
         chapters[0]['t'] = 0.0
     return chapters if len(chapters) >= 3 else []
 
+# ══════════════════════════════════════════════════════════════════
+# CAPTIONS FROM YOUR LYRICS — the on-screen text is the written lyrics
+# (always English, always spelled right); Whisper only supplies the timing.
+# ══════════════════════════════════════════════════════════════════
+
+def _is_latin(text):
+    """False when the text has letters outside Latin script (e.g. Sinhala, Arabic)."""
+    return not re.search(r'[^\x00-ɏḀ-ỿ -⁯←-⇿\s]', text or '')
+
+def build_lines_from_lyrics(lyrics_text, words, total):
+    lines = split_lyrics_lines(lyrics_text)
+    if not lines or not words:
+        return []
+
+    starts, at, cursor = [], [], 0
+    for line in lines:
+        t, cursor = _find_line_start(words, line, cursor)
+        starts.append(t)
+        at.append(cursor - 1 if t is not None else None)
+
+    found = [i for i, t in enumerate(starts) if t is not None]
+    if len(found) < max(2, len(lines) // 3):
+        return []
+
+    # lines after the last match: keep them while transcript words remain, one line per its word count
+    first, last = found[0], found[-1]
+    ptr = at[last] + len(lines[last].split())
+    end_i = last
+    for i in range(last + 1, len(lines)):
+        if ptr >= len(words):
+            break
+        starts[i] = float(words[ptr]['start'])
+        ptr += len(lines[i].split())
+        end_i = i
+
+    # lines before the first match were not sung in this audio (short clips)
+    lines, starts = lines[first:end_i + 1], starts[first:end_i + 1]
+
+    # lines between two matches share the gap
+    for i, t in enumerate(starts):
+        if t is None:
+            prev = next(starts[j] for j in range(i - 1, -1, -1) if starts[j] is not None)
+            nxt = next(starts[j] for j in range(i + 1, len(starts)) if starts[j] is not None)
+            k = next(j for j in range(i + 1, len(starts)) if starts[j] is not None)
+            p = next(j for j in range(i - 1, -1, -1) if starts[j] is not None)
+            starts[i] = prev + (nxt - prev) * (i - p) / float(k - p)
+
+    segs = []
+    for i, (line, start) in enumerate(zip(lines, starts)):
+        start = max(0.0, float(start))
+        if segs and start <= segs[-1]['start']:
+            start = segs[-1]['start'] + 0.3
+        nxt = starts[i + 1] if i + 1 < len(starts) else total
+        end = min(float(nxt) - 0.05, start + 7.0, total)
+        if end - start < 0.6:
+            end = min(total, start + 0.6)
+        if segs and segs[-1]['end'] > start:
+            segs[-1]['end'] = round(max(segs[-1]['start'] + 0.3, start - 0.03), 2)
+        segs.append({'start': round(start, 2), 'end': round(end, 2), 'text': line})
+    return segs
+
 def public_base(request: Request) -> str:
     # behind Render's proxy request.base_url comes back as http://, so prefer
     # the service's own https address when Render provides it
@@ -364,8 +431,16 @@ async def song_generate(request: Request):
             if openai_key:
                 try:
                     SONG_JOBS[job_id]['status']='transcribing_lyrics'
-                    words=transcribe_audio_words_with_whisper(audio_path,openai_key)
-                    lyrics_segments=build_lines_from_words(words)
+                    words=transcribe_audio_words_with_whisper(audio_path,openai_key,lyrics_text)
+                    total_len=get_audio_duration(audio_path)
+                    # 1) your written lyrics on Whisper's timing
+                    lyrics_segments=build_lines_from_lyrics(lyrics_text,words,total_len)
+                    # 2) Whisper's own lines, only if they are in Latin script
+                    if not lyrics_segments:
+                        lines=build_lines_from_words(words)
+                        if lines and all(_is_latin(l['text']) for l in lines):
+                            lyrics_segments=lines
+                    SONG_JOBS[job_id]['lyrics_mode']='lyrics' if lyrics_segments and lyrics_text and lyrics_segments[0]['text'] in lyrics_text else ('whisper' if lyrics_segments else 'spread')
                 except Exception as e:
                     print(f"[Lyrics] Whisper failed: {e}"); lyrics_segments=[]
             # YouTube chapters from the real audio, handed back through /song/status
