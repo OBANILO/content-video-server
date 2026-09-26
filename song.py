@@ -181,7 +181,7 @@ def wrap_lyric_line(text, max_chars=44):
 def build_karaoke_filter(segments, font, lyrics_font=None):
     if lyrics_font is None: lyrics_font = font
     if not segments: return ""
-    parts=[]; FONT_SIZE=44; LINE_HEIGHT=54; MAX_CHARS=44
+    parts=[]; FONT_SIZE=44; LINE_HEIGHT=54; MAX_CHARS=52
     for seg in segments:
         start,end,raw_text=seg["start"],seg["end"],seg["text"]
         dur=max(end-start,0.5); fade_dur=min(0.18,dur/5)
@@ -350,57 +350,117 @@ def _is_latin(text):
     """False when the text has letters outside Latin script (e.g. Sinhala, Arabic)."""
     return not re.search(r'[^\x00-ɏḀ-ỿ -⁯←-⇿\s]', text or '')
 
+CAPTION_MAX_CHARS = 34   # one caption line on screen; longer lyric lines are split
+CAPTION_MAX_WORDS = 6
+
+def _chunk_line(words_in_line):
+    """Split one lyric line into short one-line captions, balanced, at commas when possible."""
+    text = " ".join(words_in_line)
+    if len(text) <= CAPTION_MAX_CHARS and len(words_in_line) <= CAPTION_MAX_WORDS:
+        return [(0, len(words_in_line))]
+    n = max(2, math.ceil(max(len(text) / CAPTION_MAX_CHARS, len(words_in_line) / CAPTION_MAX_WORDS)))
+    target = len(text) / n
+    cuts, acc, start = [], 0, 0
+    for i, w in enumerate(words_in_line[:-1]):
+        acc += len(w) + 1
+        at_comma = w.endswith((',', ';', ':'))
+        if len(cuts) < n - 1 and (acc >= target or (at_comma and acc >= target * 0.6)):
+            cuts.append((start, i + 1)); start = i + 1; acc = 0
+    cuts.append((start, len(words_in_line)))
+    return cuts
+
 def build_lines_from_lyrics(lyrics_text, words, total):
+    """
+    Your written lyrics, timed word by word against the Whisper transcript.
+    The whole song is aligned at once (difflib), so misheard words and repeated
+    choruses do not pull a line early the way first-word matching did.
+    Returns one-line caption chunks: [{'start','end','text'}].
+    """
+    import difflib
     lines = split_lyrics_lines(lyrics_text)
     if not lines or not words:
         return []
 
-    starts, at, cursor = [], [], 0
-    for line in lines:
-        t, cursor = _find_line_start(words, line, cursor)
-        starts.append(t)
-        at.append(cursor - 1 if t is not None else None)
+    lyric = []                                   # (line index, word as written, normalized)
+    for li, line in enumerate(lines):
+        for w in line.split():
+            lyric.append((li, w, normalize_word(w)))
+    a = [x[2] for x in lyric]
+    b = [w['norm'] for w in words]
 
-    found = [i for i, t in enumerate(starts) if t is not None]
-    if len(found) < max(2, len(lines) // 3):
-        return []
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    times = [None] * len(a)
+    last_b = {}
+    exact = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            for k in range(i2 - i1):
+                ww = words[j1 + k]
+                times[i1 + k] = (float(ww['start']), float(ww['end'])); last_b[i1 + k] = j1 + k
+            exact += i2 - i1
+        elif tag == 'replace':
+            # misheard words ("eye" heard as "eyes", "love" as "glove"): take the timing
+            # of whatever Whisper heard in that same spot
+            for k in range(i2 - i1):
+                j = j1 + min(j2 - j1 - 1, int(k * (j2 - j1) / float(i2 - i1)))
+                ww = words[j]
+                times[i1 + k] = (float(ww['start']), float(ww['end'])); last_b[i1 + k] = j
 
-    # lines after the last match: keep them while transcript words remain, one line per its word count
-    first, last = found[0], found[-1]
-    ptr = at[last] + len(lines[last].split())
-    end_i = last
-    for i in range(last + 1, len(lines)):
+    matched = [i for i, t in enumerate(times) if t is not None]
+    if exact < max(4, int(len(b) * 0.2)):
+        return []                                # transcript too different to trust
+
+    first, last = matched[0], matched[-1]
+
+    # words after the last match: keep following the transcript while it lasts
+    ptr = last_b[last] + 1
+    for i in range(last + 1, len(a)):
         if ptr >= len(words):
             break
-        starts[i] = float(words[ptr]['start'])
-        ptr += len(lines[i].split())
-        end_i = i
+        times[i] = (float(words[ptr]['start']), float(words[ptr]['end'])); ptr += 1
+        last = i
 
-    # lines before the first match were not sung in this audio (short clips)
-    lines, starts = lines[first:end_i + 1], starts[first:end_i + 1]
+    # unmatched words between matches share the gap evenly
+    i = first
+    while i <= last:
+        if times[i] is None:
+            j = i
+            while times[j] is None:
+                j += 1
+            t0, t1 = times[i - 1][1], times[j][0]
+            span = max(0.0, t1 - t0) / (j - i + 1)
+            for k in range(i, j):
+                s = t0 + span * (k - i + 0.5)
+                times[k] = (s, s + span * 0.8)
+            i = j
+        i += 1
 
-    # lines between two matches share the gap
-    for i, t in enumerate(starts):
-        if t is None:
-            prev = next(starts[j] for j in range(i - 1, -1, -1) if starts[j] is not None)
-            nxt = next(starts[j] for j in range(i + 1, len(starts)) if starts[j] is not None)
-            k = next(j for j in range(i + 1, len(starts)) if starts[j] is not None)
-            p = next(j for j in range(i - 1, -1, -1) if starts[j] is not None)
-            starts[i] = prev + (nxt - prev) * (i - p) / float(k - p)
-
+    # a lyric line counts as sung if any of its words fall inside the sung range
     segs = []
-    for i, (line, start) in enumerate(zip(lines, starts)):
-        start = max(0.0, float(start))
-        if segs and start <= segs[-1]['start']:
-            start = segs[-1]['start'] + 0.3
-        nxt = starts[i + 1] if i + 1 < len(starts) else total
-        end = min(float(nxt) - 0.05, start + 7.0, total)
-        if end - start < 0.6:
-            end = min(total, start + 0.6)
-        if segs and segs[-1]['end'] > start:
-            segs[-1]['end'] = round(max(segs[-1]['start'] + 0.3, start - 0.03), 2)
-        segs.append({'start': round(start, 2), 'end': round(end, 2), 'text': line})
-    return segs
+    for li, line in enumerate(lines):
+        idx = [k for k, x in enumerate(lyric) if x[0] == li and first <= k <= last]
+        if not idx:
+            continue
+        line_words = [lyric[k][1] for k in idx]
+        for c0, c1 in _chunk_line(line_words):
+            ks = idx[c0:c1]
+            segs.append({'start': times[ks[0]][0], 'end': times[ks[-1]][1],
+                         'text': " ".join(line_words[c0:c1])})
+
+    # show slightly before the voice, hold a moment after, never overlap the next caption
+    out = []
+    for n, s in enumerate(segs):
+        start = max(0.0, s['start'] - 0.15)
+        end = max(s['end'] + 0.45, start + 0.9)
+        if n + 1 < len(segs):
+            end = min(end, max(start + 0.5, segs[n + 1]['start'] - 0.2))
+        end = min(end, start + 8.0, total)
+        if out and start < out[-1]['end']:
+            start = out[-1]['end'] + 0.02
+        if end - start < 0.4:
+            end = start + 0.4
+        out.append({'start': round(start, 2), 'end': round(end, 2), 'text': s['text']})
+    return out
 
 def public_base(request: Request) -> str:
     # behind Render's proxy request.base_url comes back as http://, so prefer
