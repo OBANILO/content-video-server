@@ -27,6 +27,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 AUDIO_SEGMENTS_FOLDER = '/tmp/audio_segments'
 os.makedirs(AUDIO_SEGMENTS_FOLDER, exist_ok=True)
 
+OUT_W, OUT_H = 1920, 1080   # Full HD — was 1280x720
+UI = OUT_H / 720.0          # text/bar sizes were designed at 720p
 LYRICS_Y    = 0.80   # moved up — more space above EQ bar
 EQ_CENTER_Y = 0.93
 DARK_START  = 0.75   # dark band starts higher to cover lyrics area
@@ -155,18 +157,18 @@ def ffmpeg_escape(text):
 
 def build_artist_watermark(font_italic, artist_name="SORLUNE"):
     name=ffmpeg_escape(artist_name.upper())
-    padding=28
+    padding=int(28*UI)
     alpha_expr="0.875+0.125*sin(6.2832/4.0*t)"
     # Gold italic name top-right
     watermark=(f"drawtext=fontfile={font_italic}:text='{name}':"
-               f"fontsize=34:fontcolor=0xD4AF37@1.0:"
+               f"fontsize={int(34*UI)}:fontcolor=0xD4AF37@1.0:"
                f"borderw=2:bordercolor=black@0.80:"
                f"shadowcolor=black@0.70:shadowx=2:shadowy=2:"
                f"x=w-text_w-{padding}:y={padding}:alpha='{alpha_expr}'")
     # Gold underline decoration
     underline=(f"drawtext=fontfile={font_italic}:text='———————':"
-               f"fontsize=14:fontcolor=0xD4AF37@1.0:"
-               f"x=w-text_w-{padding}:y={padding+42}:alpha='{alpha_expr}'")
+               f"fontsize={int(14*UI)}:fontcolor=0xD4AF37@1.0:"
+               f"x=w-text_w-{padding}:y={padding+int(42*UI)}:alpha='{alpha_expr}'")
     return ",".join([watermark, underline])
 
 def wrap_lyric_line(text, max_chars=44):
@@ -181,7 +183,7 @@ def wrap_lyric_line(text, max_chars=44):
 def build_karaoke_filter(segments, font, lyrics_font=None):
     if lyrics_font is None: lyrics_font = font
     if not segments: return ""
-    parts=[]; FONT_SIZE=44; LINE_HEIGHT=54; MAX_CHARS=44
+    parts=[]; FONT_SIZE=int(44*UI); LINE_HEIGHT=int(54*UI); MAX_CHARS=44
     for seg in segments:
         start,end,raw_text=seg["start"],seg["end"],seg["text"]
         dur=max(end-start,0.5); fade_dur=min(0.18,dur/5)
@@ -192,34 +194,34 @@ def build_karaoke_filter(segments, font, lyrics_font=None):
         if len(lines)==1:
             parts.append(f"drawtext=fontfile={lyrics_font}:text='{ffmpeg_escape(lines[0])}':"
                          f"fontsize={FONT_SIZE}:fontcolor=white@1.0:"
-                         f"borderw=4:bordercolor=black@1.0:"
-                         f"shadowcolor=black@0.95:shadowx=3:shadowy=3:"
+                         f"borderw={int(4*UI)}:bordercolor=black@1.0:"
+                         f"shadowcolor=black@0.95:shadowx={int(3*UI)}:shadowy={int(3*UI)}:"
                          f"x=(w-text_w)/2:y=h*{LYRICS_Y}:alpha='{alpha_expr}'")
         else:
             base_y=LYRICS_Y-0.045
             for li,line in enumerate(lines):
                 parts.append(f"drawtext=fontfile={lyrics_font}:text='{ffmpeg_escape(line)}':"
                              f"fontsize={FONT_SIZE}:fontcolor=white@1.0:"
-                             f"borderw=4:bordercolor=black@1.0:"
-                             f"shadowcolor=black@0.95:shadowx=3:shadowy=3:"
+                             f"borderw={int(4*UI)}:bordercolor=black@1.0:"
+                             f"shadowcolor=black@0.95:shadowx={int(3*UI)}:shadowy={int(3*UI)}:"
                              f"x=(w-text_w)/2:y=h*{base_y}+{li*LINE_HEIGHT}:alpha='{alpha_expr}'")
     return ",".join(parts)
 
 def build_eq_bar(font):
-    parts=[]; bar_count=30; bar_gap=14; half=bar_count//2; center_y=f"h*{EQ_CENTER_Y}"
+    parts=[]; bar_count=30; bar_gap=int(14*UI); half=bar_count//2; center_y=f"h*{EQ_CENTER_Y}"
     freqs=[1.3,2.1,2.7,1.9,3.1,2.4,1.7,2.9,2.2,3.5,2.0,2.8,2.1,2.8,2.0,3.5,2.2,2.9,1.7,2.4,3.1,1.9,2.7,2.1,1.3,1.8,2.5,3.0,1.6,2.3]
     phases=[0.0,0.5,1.1,1.7,0.3,0.9,1.5,0.2,0.8,1.4,0.6,1.2,0.0,1.2,0.6,1.4,0.8,0.2,1.5,0.9,0.3,1.7,1.1,0.5,0.0,0.7,1.3,0.4,1.0,1.6]
     for i in range(bar_count):
-        dist=abs(i-half)/half; amplitude=int(5+36*math.exp(-2.5*dist*dist))
+        dist=abs(i-half)/half; amplitude=int((5+36*math.exp(-2.5*dist*dist))*UI)
         alpha_up=0.90-0.25*dist; alpha_dwn=0.40-0.15*dist
-        offset=(i-half)*bar_gap; bar_x=f"(w/2+({offset})-tw/2)"; fs_expr=f"4+{amplitude}*abs(sin(t*{freqs[i]}+{phases[i]}))"
+        offset=(i-half)*bar_gap; bar_x=f"(w/2+({offset})-tw/2)"; fs_expr=f"{int(4*UI)}+{amplitude}*abs(sin(t*{freqs[i]}+{phases[i]}))"
         parts.append(f"drawtext=fontfile={font}:text='|':fontsize={fs_expr}:fontcolor=0xD4AF37@{alpha_up:.2f}:x={bar_x}:y=({center_y})-text_h")
         parts.append(f"drawtext=fontfile={font}:text='|':fontsize={fs_expr}:fontcolor=0xB8860B@{alpha_dwn:.2f}:x={bar_x}:y={center_y}")
     return ",".join(parts)
 
 def build_ffmpeg_command(image_path, audio_path, output_path, duration, fps, font, font_italic, lyrics_font=None, lyrics_segments=None, artist_name="SORLUNE"):
     frames=int(duration*fps); fade_out_st=max(duration-3,duration*0.85); z_inc=0.08/max(frames,1)
-    zoom_filter=(f"scale=3840:2160:flags=lanczos,zoompan=z='min(1.00+{z_inc:.8f}*on,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps={fps}")
+    zoom_filter=(f"scale=3840:2160:flags=lanczos,zoompan=z='min(1.00+{z_inc:.8f}*on,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={OUT_W}x{OUT_H}:fps={fps}")
     light_filter=(f"eq=brightness='0.03*sin(t*2.2+0.3)':contrast='1.04+0.03*sin(t*1.8+1.0)':saturation='1.06+0.08*sin(t*2.5+0.8)'")
     grade_filter="curves=r='0/0 0.5/0.53 1/1':g='0/0 0.5/0.48 1/0.95':b='0/0 0.5/0.43 1/0.86',vignette=PI/4.5,noise=alls=3:allf=t"
     fade_filter=f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
