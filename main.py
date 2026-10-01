@@ -62,6 +62,10 @@ class GenerateRequest(BaseModel):
     scene_anchor: str = ""                     # e.g. "television"
     ban_terms: Optional[List[str]] = []        # e.g. ["instagram", "office meeting"]
 
+    # NEW: your own recorded voiceover. When set, no TTS is generated —
+    # this file becomes the narration and the script is only used for scenes.
+    audio_url: str = ""
+
     # NEW: spelling the voice gets wrong -> how to write it so it reads correctly.
     # [{"from": "4kukiptv", "to": "four K U K I P T V"}]  — applied to the AUDIO only.
     say_as: Optional[List[Dict[str, str]]] = []
@@ -84,7 +88,7 @@ def generate_video(req: GenerateRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="api_key missing")
     if len(req.script.strip()) < 50:
         raise HTTPException(status_code=400, detail="script too short")
-    if not req.elevenlabs_key or not req.elevenlabs_voice:
+    if not req.audio_url and (not req.elevenlabs_key or not req.elevenlabs_voice):
         raise HTTPException(status_code=400, detail="ElevenLabs key/voice missing")
     if not req.pexels_key:
         raise HTTPException(status_code=400, detail="Pexels key missing")
@@ -178,6 +182,94 @@ def short_render(req: ShortRenderRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_short_render, req.model_dump())
     return {"ok": True, "status": "processing"}
 
+def extract_audio_for_asr(src: Path, dest: Path) -> bool:
+    """
+    Speech-only MP3 for transcription: mono, 16 kHz, 48 kbps.
+    Roughly 0.36 MB per minute, so even a long video stays under Whisper's 25 MB.
+    """
+    cmd = ["ffmpeg", "-y", "-i", str(src),
+           "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
+           "-c:a", "libmp3lame", str(dest)]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return res.returncode == 0 and dest.exists() and dest.stat().st_size > 10000
+
+class TranscribeRequest(BaseModel):
+    api_key: str
+    audio_url: str
+    openai_key: str
+
+@app.post("/transcribe")
+def transcribe_audio(req: TranscribeRequest, background_tasks: BackgroundTasks):
+    """Turn a recorded voiceover into the script it will be rendered against."""
+    if not req.api_key:
+        raise HTTPException(status_code=400, detail="api_key missing")
+    if not req.audio_url:
+        raise HTTPException(status_code=400, detail="audio_url missing")
+    if not req.openai_key:
+        raise HTTPException(status_code=400, detail="openai_key missing")
+
+    JOBS[req.api_key] = {
+        "job_id": str(uuid.uuid4()),
+        "status": "processing",
+        "step": "downloading your recording",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "text": "",
+        "error": "",
+        "kind": "transcribe",
+    }
+    background_tasks.add_task(run_transcribe, req.model_dump())
+    return {"ok": True, "status": "processing"}
+
+def run_transcribe(data: Dict[str, Any]):
+    api_key = data["api_key"]
+    work = TEMP_DIR / ("vo_" + re.sub(r"[^A-Za-z0-9]", "", api_key)[:24])
+    work.mkdir(parents=True, exist_ok=True)
+
+    try:
+        raw = work / "recording"
+        if not _fetch_video(data["audio_url"], raw):
+            update_job(api_key, status="error", step="failed",
+                       error="could not download that recording")
+            return
+
+        duration = 0.0
+        try:
+            duration = get_duration(raw)
+        except Exception:
+            pass
+
+        # same trick as the shorts scanner: Whisper caps uploads at 25 MB
+        asr = work / "asr.mp3"
+        if not extract_audio_for_asr(raw, asr):
+            update_job(api_key, status="error", step="failed",
+                       error="that file has no readable audio track")
+            return
+
+        size_mb = asr.stat().st_size / (1024 * 1024)
+        if size_mb > 24:
+            update_job(api_key, status="error", step="failed",
+                       error=f"recording is {size_mb:.0f} MB of audio, over the 25 MB limit")
+            return
+
+        update_job(api_key, step=f"transcribing ({duration:.0f}s)")
+        words = transcribe_words(asr, data["openai_key"])
+
+        if not words:
+            update_job(api_key, status="error", step="failed",
+                       error="nothing could be transcribed from that recording")
+            return
+
+        text = " ".join(w["word"].strip() for w in words).strip()
+        text = re.sub(r"\s+([.,!?])", r"\1", text)
+
+        update_job(api_key, status="completed", step="done",
+                   text=text, word_count=len(words),
+                   audio_duration=round(duration, 1))
+
+    except Exception as e:
+        update_job(api_key, status="error", step="failed", error=str(e))
+
 def _fetch_video(url: str, dest: Path) -> bool:
     try:
         with requests.get(url, stream=True, timeout=600) as r:
@@ -205,8 +297,30 @@ def run_short_scan(data: Dict[str, Any]):
         total = get_duration(src)
         update_job(api_key, step="listening to the video", source_duration=round(total, 1))
 
-        words = transcribe_words(src, data.get("openai_key", "")) if data.get("openai_key") else []
+        words: List[Dict[str, Any]] = []
+        why_no_words = ""
+
+        if data.get("openai_key"):
+            # Whisper refuses anything over 25 MB, and a long video is far past
+            # that. Send it the audio only, mono and low bitrate — an hour of
+            # speech comes out around 20 MB.
+            audio = work / "asr.mp3"
+            if extract_audio_for_asr(src, audio):
+                size_mb = audio.stat().st_size / (1024 * 1024)
+                update_job(api_key, step=f"transcribing ({size_mb:.1f} MB of audio)")
+                if size_mb > 24:
+                    why_no_words = f"audio is {size_mb:.0f} MB, over the 25 MB transcription limit"
+                else:
+                    words = transcribe_words(audio, data["openai_key"])
+                    if not words:
+                        why_no_words = "transcription returned nothing"
+            else:
+                why_no_words = "could not extract the audio track"
+        else:
+            why_no_words = "no OpenAI key sent"
+
         if not words:
+            update_job(api_key, transcript="unavailable", transcript_reason=why_no_words)
             # no transcript: offer the opening and the middle
             wins = [
                 {"start": 0.0, "end": min(SHORT_MAX, total), "text": "the opening", "why": "hook"},
@@ -366,18 +480,23 @@ def run_generation(data: Dict[str, Any], job_id: str):
     try:
         niche = data.get("niche") or detect_niche(data)
 
-        update_job(api_key, step="creating voiceover", niche=niche)
         audio_path = work / "voice.mp3"
 
-        # the voice gets a respelled copy; the captions keep your real spelling
-        spoken_text = apply_say_as(data["script"], data.get("say_as") or [])
-
-        make_voiceover(
-            text=spoken_text,
-            elevenlabs_key=data["elevenlabs_key"],
-            voice_id=data["elevenlabs_voice"],
-            output_path=audio_path
-        )
+        if data.get("audio_url"):
+            # ✅ you recorded the narration yourself — no TTS at all
+            update_job(api_key, step="fetching your voiceover", niche=niche)
+            if not _fetch_video(data["audio_url"], audio_path):
+                raise RuntimeError("could not download your voiceover")
+        else:
+            update_job(api_key, step="creating voiceover", niche=niche)
+            # the voice gets a respelled copy; the captions keep your real spelling
+            spoken_text = apply_say_as(data["script"], data.get("say_as") or [])
+            make_voiceover(
+                text=spoken_text,
+                elevenlabs_key=data["elevenlabs_key"],
+                voice_id=data["elevenlabs_voice"],
+                output_path=audio_path
+            )
         audio_duration = max(10.0, get_duration(audio_path))
 
         conversion_images: List[Path] = []
@@ -495,7 +614,7 @@ def build_scene_plan(data: Dict[str, Any], niche: str, audio_duration: float) ->
             visual = str(s.get("visual") or "broll").strip().lower()
             if not text:
                 continue
-            if visual not in ("broll", "screenshot") and not re.fullmatch(r"clip\d{1,2}", visual):
+            if visual not in ("broll", "screenshot"):
                 visual = "broll"
             scenes.append({"text": text, "query": query, "visual": visual})
 
