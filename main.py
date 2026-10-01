@@ -28,18 +28,16 @@ SEGMENT_MAX = 9.0      # longest a single scene may be on screen
 # libass falls back on its own. Heavy weight, thick outline, no drop shadow,
 # lifted off the bottom edge so YouTube's controls never sit on it.
 CAPTION_STYLE = ",".join([
-    "FontName=Montserrat",
-    "Fontsize=27",
-    "Bold=1",
+    "FontName=Montserrat",           # falls back to Liberation Sans if absent
+    "Fontsize=24",                   # 27 was wrapping onto two lines
+    "Bold=0",                        # Montserrat is already heavy enough
     "PrimaryColour=&H00FFFFFF",      # white text
     "OutlineColour=&H00000000",      # black outline
-    "BackColour=&H90000000",         # soft shadow plate
     "BorderStyle=1",
-    "Outline=3",
+    "Outline=2",
     "Shadow=1",
     "Alignment=2",                   # bottom centre
-    "MarginV=70",
-    "Spacing=0.4",
+    "MarginV=22",                    # sits at the bottom, where it was before
 ])
 
 app = FastAPI(title=APP_NAME)
@@ -797,7 +795,7 @@ def apply_say_as(text: str, rules: List[Dict[str, str]]) -> str:
         out = re.sub(re.escape(frm), to, out, flags=re.IGNORECASE)
     return out
 
-def build_srt_from_aligned_scenes(scenes: List[Dict[str, Any]], output_path: Path, per_line: int = 7):
+def build_srt_from_aligned_scenes(scenes: List[Dict[str, Any]], output_path: Path, per_line: int = 6):
     """
     Captions taken from YOUR script text, placed on the measured timeline.
 
@@ -839,7 +837,7 @@ def build_srt_from_aligned_scenes(scenes: List[Dict[str, Any]], output_path: Pat
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
-def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_line: int = 7):
+def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_line: int = 6):
     """Captions straight off the measured timings — they cannot drift."""
     lines: List[str] = []
     idx = 1
