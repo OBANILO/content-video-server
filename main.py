@@ -24,6 +24,22 @@ TEMP_DIR.mkdir(exist_ok=True)
 SEGMENT_MIN = 2.5      # shortest a single scene may be on screen
 SEGMENT_MAX = 9.0      # longest a single scene may be on screen
 
+# Caption look. Montserrat if the image has it, Liberation Sans otherwise —
+# libass falls back on its own. Heavy weight, thick outline, no drop shadow,
+# lifted off the bottom edge so YouTube's controls never sit on it.
+CAPTION_STYLE = ",".join([
+    "FontName=Montserrat",           # falls back to Liberation Sans if absent
+    "Fontsize=24",                   # 27 was wrapping onto two lines
+    "Bold=0",                        # Montserrat is already heavy enough
+    "PrimaryColour=&H00FFFFFF",      # white text
+    "OutlineColour=&H00000000",      # black outline
+    "BorderStyle=1",
+    "Outline=2",
+    "Shadow=1",
+    "Alignment=2",                   # bottom centre
+    "MarginV=22",                    # sits at the bottom, where it was before
+])
+
 app = FastAPI(title=APP_NAME)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
@@ -62,6 +78,10 @@ class GenerateRequest(BaseModel):
     scene_anchor: str = ""                     # e.g. "television"
     ban_terms: Optional[List[str]] = []        # e.g. ["instagram", "office meeting"]
 
+    # NEW: your own recorded voiceover. When set, no TTS is generated —
+    # this file becomes the narration and the script is only used for scenes.
+    audio_url: str = ""
+
     # NEW: spelling the voice gets wrong -> how to write it so it reads correctly.
     # [{"from": "4kukiptv", "to": "four K U K I P T V"}]  — applied to the AUDIO only.
     say_as: Optional[List[Dict[str, str]]] = []
@@ -84,7 +104,7 @@ def generate_video(req: GenerateRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="api_key missing")
     if len(req.script.strip()) < 50:
         raise HTTPException(status_code=400, detail="script too short")
-    if not req.elevenlabs_key or not req.elevenlabs_voice:
+    if not req.audio_url and (not req.elevenlabs_key or not req.elevenlabs_voice):
         raise HTTPException(status_code=400, detail="ElevenLabs key/voice missing")
     if not req.pexels_key:
         raise HTTPException(status_code=400, detail="Pexels key missing")
@@ -182,6 +202,94 @@ def short_render(req: ShortRenderRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_short_render, req.model_dump())
     return {"ok": True, "status": "processing"}
 
+def extract_audio_for_asr(src: Path, dest: Path) -> bool:
+    """
+    Speech-only MP3 for transcription: mono, 16 kHz, 48 kbps.
+    Roughly 0.36 MB per minute, so even a long video stays under Whisper's 25 MB.
+    """
+    cmd = ["ffmpeg", "-y", "-i", str(src),
+           "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
+           "-c:a", "libmp3lame", str(dest)]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return res.returncode == 0 and dest.exists() and dest.stat().st_size > 10000
+
+class TranscribeRequest(BaseModel):
+    api_key: str
+    audio_url: str
+    openai_key: str
+
+@app.post("/transcribe")
+def transcribe_audio(req: TranscribeRequest, background_tasks: BackgroundTasks):
+    """Turn a recorded voiceover into the script it will be rendered against."""
+    if not req.api_key:
+        raise HTTPException(status_code=400, detail="api_key missing")
+    if not req.audio_url:
+        raise HTTPException(status_code=400, detail="audio_url missing")
+    if not req.openai_key:
+        raise HTTPException(status_code=400, detail="openai_key missing")
+
+    JOBS[req.api_key] = {
+        "job_id": str(uuid.uuid4()),
+        "status": "processing",
+        "step": "downloading your recording",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "text": "",
+        "error": "",
+        "kind": "transcribe",
+    }
+    background_tasks.add_task(run_transcribe, req.model_dump())
+    return {"ok": True, "status": "processing"}
+
+def run_transcribe(data: Dict[str, Any]):
+    api_key = data["api_key"]
+    work = TEMP_DIR / ("vo_" + re.sub(r"[^A-Za-z0-9]", "", api_key)[:24])
+    work.mkdir(parents=True, exist_ok=True)
+
+    try:
+        raw = work / "recording"
+        if not _fetch_video(data["audio_url"], raw):
+            update_job(api_key, status="error", step="failed",
+                       error="could not download that recording")
+            return
+
+        duration = 0.0
+        try:
+            duration = get_duration(raw)
+        except Exception:
+            pass
+
+        # same trick as the shorts scanner: Whisper caps uploads at 25 MB
+        asr = work / "asr.mp3"
+        if not extract_audio_for_asr(raw, asr):
+            update_job(api_key, status="error", step="failed",
+                       error="that file has no readable audio track")
+            return
+
+        size_mb = asr.stat().st_size / (1024 * 1024)
+        if size_mb > 24:
+            update_job(api_key, status="error", step="failed",
+                       error=f"recording is {size_mb:.0f} MB of audio, over the 25 MB limit")
+            return
+
+        update_job(api_key, step=f"transcribing ({duration:.0f}s)")
+        words = transcribe_words(asr, data["openai_key"])
+
+        if not words:
+            update_job(api_key, status="error", step="failed",
+                       error="nothing could be transcribed from that recording")
+            return
+
+        text = " ".join(w["word"].strip() for w in words).strip()
+        text = re.sub(r"\s+([.,!?])", r"\1", text)
+
+        update_job(api_key, status="completed", step="done",
+                   text=text, word_count=len(words),
+                   audio_duration=round(duration, 1))
+
+    except Exception as e:
+        update_job(api_key, status="error", step="failed", error=str(e))
+
 def _fetch_video(url: str, dest: Path) -> bool:
     try:
         with requests.get(url, stream=True, timeout=600) as r:
@@ -209,8 +317,30 @@ def run_short_scan(data: Dict[str, Any]):
         total = get_duration(src)
         update_job(api_key, step="listening to the video", source_duration=round(total, 1))
 
-        words = transcribe_words(src, data.get("openai_key", "")) if data.get("openai_key") else []
+        words: List[Dict[str, Any]] = []
+        why_no_words = ""
+
+        if data.get("openai_key"):
+            # Whisper refuses anything over 25 MB, and a long video is far past
+            # that. Send it the audio only, mono and low bitrate — an hour of
+            # speech comes out around 20 MB.
+            audio = work / "asr.mp3"
+            if extract_audio_for_asr(src, audio):
+                size_mb = audio.stat().st_size / (1024 * 1024)
+                update_job(api_key, step=f"transcribing ({size_mb:.1f} MB of audio)")
+                if size_mb > 24:
+                    why_no_words = f"audio is {size_mb:.0f} MB, over the 25 MB transcription limit"
+                else:
+                    words = transcribe_words(audio, data["openai_key"])
+                    if not words:
+                        why_no_words = "transcription returned nothing"
+            else:
+                why_no_words = "could not extract the audio track"
+        else:
+            why_no_words = "no OpenAI key sent"
+
         if not words:
+            update_job(api_key, transcript="unavailable", transcript_reason=why_no_words)
             # no transcript: offer the opening and the middle
             wins = [
                 {"start": 0.0, "end": min(SHORT_MAX, total), "text": "the opening", "why": "hook"},
@@ -370,18 +500,23 @@ def run_generation(data: Dict[str, Any], job_id: str):
     try:
         niche = data.get("niche") or detect_niche(data)
 
-        update_job(api_key, step="creating voiceover", niche=niche)
         audio_path = work / "voice.mp3"
 
-        # the voice gets a respelled copy; the captions keep your real spelling
-        spoken_text = apply_say_as(data["script"], data.get("say_as") or [])
-
-        make_voiceover(
-            text=spoken_text,
-            elevenlabs_key=data["elevenlabs_key"],
-            voice_id=data["elevenlabs_voice"],
-            output_path=audio_path
-        )
+        if data.get("audio_url"):
+            # ✅ you recorded the narration yourself — no TTS at all
+            update_job(api_key, step="fetching your voiceover", niche=niche)
+            if not _fetch_video(data["audio_url"], audio_path):
+                raise RuntimeError("could not download your voiceover")
+        else:
+            update_job(api_key, step="creating voiceover", niche=niche)
+            # the voice gets a respelled copy; the captions keep your real spelling
+            spoken_text = apply_say_as(data["script"], data.get("say_as") or [])
+            make_voiceover(
+                text=spoken_text,
+                elevenlabs_key=data["elevenlabs_key"],
+                voice_id=data["elevenlabs_voice"],
+                output_path=audio_path
+            )
         audio_duration = max(10.0, get_duration(audio_path))
 
         conversion_images: List[Path] = []
@@ -499,7 +634,7 @@ def build_scene_plan(data: Dict[str, Any], niche: str, audio_duration: float) ->
             visual = str(s.get("visual") or "broll").strip().lower()
             if not text:
                 continue
-            if visual not in ("broll", "screenshot") and not re.fullmatch(r"clip\d{1,2}", visual):
+            if visual not in ("broll", "screenshot"):
                 visual = "broll"
             scenes.append({"text": text, "query": query, "visual": visual})
 
@@ -664,7 +799,7 @@ def apply_say_as(text: str, rules: List[Dict[str, str]]) -> str:
         out = re.sub(re.escape(frm), to, out, flags=re.IGNORECASE)
     return out
 
-def build_srt_from_aligned_scenes(scenes: List[Dict[str, Any]], output_path: Path, per_line: int = 7):
+def build_srt_from_aligned_scenes(scenes: List[Dict[str, Any]], output_path: Path, per_line: int = 6):
     """
     Captions taken from YOUR script text, placed on the measured timeline.
 
@@ -706,7 +841,7 @@ def build_srt_from_aligned_scenes(scenes: List[Dict[str, Any]], output_path: Pat
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
-def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_line: int = 7):
+def build_srt_from_words(words: List[Dict[str, Any]], output_path: Path, per_line: int = 6):
     """Captions straight off the measured timings — they cannot drift."""
     lines: List[str] = []
     idx = 1
@@ -795,6 +930,10 @@ def attach_visuals(scenes: List[Dict[str, Any]], pexels_key: str, work_dir: Path
                 continue
             scene["visual"] = "broll"  # nothing to show, fall back to b-roll
 
+        # ✅ the footage has to agree with what is being said right then
+        mood = scene_mood(scene.get("text", ""))
+        scene["mood"] = mood
+
         clip = download_clip_for_query(
             query=scene["query"],
             pexels_key=pexels_key,
@@ -803,7 +942,8 @@ def attach_visuals(scenes: List[Dict[str, Any]], pexels_key: str, work_dir: Path
             used_video_ids=used_video_ids,
             used_links=used_links,
             anchor=anchor,
-            ban_terms=ban_terms
+            ban_terms=list(ban_terms) + list(_MOOD_BAN.get(mood, ())),
+            mood=mood
         )
         scene["clip"] = clip
 
@@ -821,6 +961,54 @@ def attach_visuals(scenes: List[Dict[str, Any]], pexels_key: str, work_dir: Path
 
     return scenes
 
+# Words that tell us whether a line is describing the PROBLEM or the RESULT.
+# Showing a happy family while the narrator talks about buffering — or a frozen
+# screen while he says it works perfectly — reads as a lie and kills the sell.
+_BAD_WORDS = ("buffer", "freez", "frozen", "lag", "angry", "frustrat", "annoy",
+              "problem", "issue", "error", "slow", "waste", "wasted", "scam",
+              "vanish", "broken", "stuck", "fail", "crash", "cheap seller",
+              "disappear", "tired of", "sick of", "never works", "spinning")
+_GOOD_WORDS = ("smooth", "instant", "works", "worked", "working", "clear", "perfect",
+               "enjoy", "happy", "love", "great", "finally", "fast", "reliable",
+               "stable", "easy", "no more", "zero", "crisp", "sharp", "relax")
+_NEGATED = ("no buffer", "without buffer", "never buffer", "no freez", "no lag",
+            "zero buffer", "no more buffer", "stopped buffering")
+
+_MOOD_HINT = {
+    "bad":  ("frustrated", "annoyed person", "loading", "waiting"),
+    "good": ("happy", "smiling", "enjoying", "relaxed"),
+}
+_MOOD_BAN = {
+    # praising the service -> never show the failure imagery
+    "good": ("angry", "frustrated", "sad", "stressed", "worried", "buffering",
+             "loading screen", "error", "broken", "bored", "tired", "serious",
+             "screaming", "distress", "crying", "upset", "lonely", "arguing",
+             "shouting", "disappointed", "confused", "exhausted", "problem"),
+    # describing the failure -> never show people enjoying themselves
+    "bad":  ("happy", "smiling", "celebrating", "laughing", "relaxing", "enjoying",
+             "cheerful", "excited", "cheering", "cheer", "fun", "joy", "delighted",
+             "pleased", "cozy", "comfortable", "chilling", "cuddling", "party",
+             "smiles", "having a good time"),
+}
+
+def scene_mood(text: str) -> str:
+    """'bad' while describing the problem, 'good' while describing the fix."""
+    t = " " + str(text or "").lower() + " "
+
+    # "no buffering" is a promise, not a complaint
+    for n in _NEGATED:
+        if n in t:
+            return "good"
+
+    bad = sum(1 for w in _BAD_WORDS if w in t)
+    good = sum(1 for w in _GOOD_WORDS if w in t)
+
+    if bad > good:
+        return "bad"
+    if good > bad:
+        return "good"
+    return "neutral"
+
 def _clip_is_off_topic(video: Dict[str, Any], ban_terms: List[str]) -> bool:
     """Pexels puts the description in the page URL slug — use it to reject junk."""
     if not ban_terms:
@@ -828,70 +1016,185 @@ def _clip_is_off_topic(video: Dict[str, Any], ban_terms: List[str]) -> bool:
     slug = str(video.get("url", "")).lower().replace("-", " ")
     return any(b and b in slug for b in ban_terms)
 
+def _candidate_text(video: Dict[str, Any]) -> str:
+    """
+    Everything Pexels tells us about a clip, as one searchable string.
+    The page URL carries the human description as a slug
+    ("a-family-cheering-while-watching-a-football-game-at-home-5725960"),
+    which is the only real signal the API gives us about content.
+    """
+    slug = str(video.get("url", "")).rstrip("/").split("/")[-1]
+    slug = re.sub(r"-\d+$", "", slug).replace("-", " ")
+    alt = str(video.get("alt", "") or "")
+    return (slug + " " + alt).lower().strip()
+
+def _score_candidate(video: Dict[str, Any], query_words: List[str], mood: str,
+                     anchor: str) -> float:
+    """
+    Rank a clip instead of taking the first one that is not banned.
+    Rewards: words from the line, the niche anchor, the right mood, a usable
+    length, and a high-resolution 16:9 source.
+    """
+    text = _candidate_text(video)
+    if not text:
+        return -50.0
+
+    score = 0.0
+
+    # what the line is actually about
+    for w in query_words:
+        if len(w) > 2 and w in text:
+            score += 3.0
+
+    if anchor and anchor.lower() in text:
+        score += 2.5
+
+    # mood agreement — the thing that stops a smiling family under "I wasted money"
+    for w in _MOOD_HINT.get(mood, ()):
+        if w.split()[0] in text:
+            score += 4.0
+    for w in _MOOD_BAN.get(mood, ()):
+        if w.split()[0] in text:
+            score -= 13.0
+
+    # people make b-roll feel like a real ad, empty rooms do not
+    if any(w in text for w in ("man", "woman", "people", "family", "couple",
+                               "friends", "group", "boy", "girl", "person")):
+        score += 1.5
+
+    # length: long enough to cut a scene from, not a 3-second loop
+    dur = float(video.get("duration") or 0)
+    if 8 <= dur <= 30:
+        score += 3.0
+    elif dur < 5:
+        score -= 4.0
+    elif dur > 45:
+        score -= 1.0
+
+    # resolution and shape — a 4K landscape source downscales beautifully
+    w_px = int(video.get("width") or 0)
+    h_px = int(video.get("height") or 0)
+    if w_px and h_px:
+        if w_px < h_px:
+            score -= 12.0                      # vertical, unusable in a 16:9 frame
+        else:
+            ratio = w_px / max(h_px, 1)
+            if 1.6 <= ratio <= 2.0:
+                score += 2.0
+            else:
+                score -= 2.0
+            if w_px >= 3840:
+                score += 3.0
+            elif w_px >= 1920:
+                score += 2.0
+            else:
+                score -= 3.0                   # below 1080p looks cheap
+
+    return score
+
 def download_clip_for_query(query: str, pexels_key: str, work_dir: Path, idx: int,
                             used_video_ids: set, used_links: set,
-                            anchor: str = "", ban_terms: Optional[List[str]] = None) -> Optional[Path]:
-    """Download ONE landscape clip that matches this scene's query, inside the niche."""
+                            anchor: str = "", ban_terms: Optional[List[str]] = None,
+                            mood: str = "neutral") -> Optional[Path]:
+    """
+    Find the BEST matching landscape clip for this line, not the first one.
+
+    Gathers candidates across a few phrasings, scores each on relevance, mood,
+    length and resolution, then downloads them best-first until one lands.
+    """
     headers = {"Authorization": pexels_key}
     ban_terms = ban_terms or []
     anchor = (anchor or "").strip()
 
-    words = query.split()
-    attempts: List[str] = []
+    query_words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) > 2]
 
-    # anchored first: "buffering wheel" alone drifts, "buffering wheel television" does not
+    attempts: List[str] = []
+    hints = _MOOD_HINT.get(mood, ())
+    if hints:
+        h = hints[idx % len(hints)]
+        if h not in query.lower():
+            attempts.append(f"{query} {h}")
     if anchor and anchor.lower() not in query.lower():
         attempts.append(f"{query} {anchor}")
     attempts.append(query)
-    if len(words) > 2:
-        attempts.append(" ".join(words[:2]) + (f" {anchor}" if anchor else ""))
-    # last resort stays inside the niche instead of "business office technology"
+    if len(query.split()) > 2:
+        attempts.append(" ".join(query.split()[:2]) + (f" {anchor}" if anchor else ""))
     attempts.append(anchor if anchor else "business office technology")
 
     seen_q = set()
     attempts = [q for q in attempts if q.strip() and not (q in seen_q or seen_q.add(q))]
 
+    # ── gather ────────────────────────────────────────────────────────
+    candidates: List[Dict[str, Any]] = []
+    seen_ids = set()
+
     for q in attempts:
+        if len(candidates) >= 24:
+            break
         for page in (1, 2):
-            params = {"query": q, "per_page": 10, "orientation": "landscape", "size": "medium", "page": page}
+            params = {"query": q, "per_page": 12, "orientation": "landscape",
+                      "size": "medium", "page": page}
             try:
-                r = requests.get("https://api.pexels.com/videos/search", headers=headers, params=params, timeout=40)
+                r = requests.get("https://api.pexels.com/videos/search",
+                                 headers=headers, params=params, timeout=40)
                 if r.status_code >= 400:
                     continue
                 videos = r.json().get("videos", [])
             except Exception:
                 continue
 
-            for video in videos:
-                vid = str(video.get("id", ""))
-                if vid and vid in used_video_ids:
+            for v in videos:
+                vid = str(v.get("id", ""))
+                if vid and (vid in used_video_ids or vid in seen_ids):
                     continue
-                if _clip_is_off_topic(video, ban_terms):
+                if _clip_is_off_topic(v, ban_terms):
                     continue
-                link = pick_best_video_file(video.get("video_files", []))
-                if not link or link in used_links:
+                if not pick_best_video_file(v.get("video_files", [])):
                     continue
+                seen_ids.add(vid)
+                candidates.append(v)
 
-                out = work_dir / f"scene_{idx:03d}_{vid or random.randint(1000, 9999)}.mp4"
-                try:
-                    with requests.get(link, stream=True, timeout=120) as resp:
-                        resp.raise_for_status()
-                        with open(out, "wb") as f:
-                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                                if chunk:
-                                    f.write(chunk)
-                    if out.exists() and out.stat().st_size > 100000:
-                        if vid:
-                            used_video_ids.add(vid)
-                        used_links.add(link)
-                        return out
-                    out.unlink(missing_ok=True)
-                except Exception:
-                    try:
-                        out.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    continue
+            if len(candidates) >= 24:
+                break
+
+    if not candidates:
+        return None
+
+    # ── rank ──────────────────────────────────────────────────────────
+    ranked = sorted(
+        candidates,
+        key=lambda v: _score_candidate(v, query_words, mood, anchor),
+        reverse=True,
+    )
+
+    # ── download, best first ──────────────────────────────────────────
+    for v in ranked[:6]:
+        link = pick_best_video_file(v.get("video_files", []))
+        if not link or link in used_links:
+            continue
+
+        vid = str(v.get("id", ""))
+        out = work_dir / f"scene_{idx:03d}_{vid or random.randint(1000, 9999)}.mp4"
+        try:
+            with requests.get(link, stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                with open(out, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            if out.exists() and out.stat().st_size > 100000:
+                if vid:
+                    used_video_ids.add(vid)
+                used_links.add(link)
+                return out
+            out.unlink(missing_ok=True)
+        except Exception:
+            try:
+                out.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+
     return None
 
 # ══════════════════════════════════════════════════════════════════
@@ -1459,23 +1762,48 @@ def render_scene_video(scenes: List[Dict[str, Any]], audio_path: Path, audio_dur
         if scene.get("clip"):
             last_good = scene["clip"]
 
+    # ✅ the picture must last as long as the voice. Freezing the last frame to
+    # fill the gap made the end of the video look like it had hung, so fill it
+    # with real moving footage instead.
+    def _total_len(paths: List[Path]) -> float:
+        t = 0.0
+        for q in paths:
+            try:
+                t += get_duration(q)
+            except Exception:
+                pass
+        return t
+
+    video_len = _total_len(segment_paths)
+    guard = 0
+    while video_len < audio_duration - 0.15 and guard < 25:
+        guard += 1
+        want = min(6.0, max(1.5, audio_duration - video_len + 0.5))
+        seg = segment_dir / f"tail_{guard:03d}.mp4"
+
+        made = own_segment(seg, want)
+        if not made and last_good is not None:
+            made = make_broll_segment(last_good, seg, want)
+        if not made:
+            create_color_video(seg, duration=want)
+
+        segment_paths.append(seg)
+        new_len = _total_len(segment_paths)
+        if new_len <= video_len + 0.05:      # nothing is growing, stop looping
+            break
+        video_len = new_len
+
     concat_file = TEMP_DIR / f"concat_{output_path.stem}.txt"
     concat_file.write_text("\n".join([f"file '{p.as_posix()}'" for p in segment_paths]), encoding="utf-8")
     sub_path = subtitles_path.as_posix().replace(":", "\\:")
     vf = ("scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,setpts=PTS-STARTPTS,format=yuv420p,"
-          + f"subtitles='{sub_path}':force_style='Fontsize=24,Outline=2,Shadow=1,Alignment=2'")
+          + f"subtitles='{sub_path}':force_style='{CAPTION_STYLE}'")
 
     # ✅ if the assembled video is even slightly shorter than the voiceover,
     # "-shortest" would cut the audio off mid-sentence. Hold the last frame
     # instead, and let "-t audio_duration" decide the length.
-    video_len = 0.0
-    for p in segment_paths:
-        try:
-            video_len += get_duration(p)
-        except Exception:
-            pass
-
-    tail = max(0.0, audio_duration - video_len) + 1.0
+    # everything above already covers the audio; this is just rounding slack
+    tail = max(0.0, audio_duration - _total_len(segment_paths)) + 0.4
     vf = vf + f",tpad=stop_mode=clone:stop_duration={round(tail, 2)}"
 
     cmd = [
