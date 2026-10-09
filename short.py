@@ -248,34 +248,40 @@ def build_song_title(font, title=""):
 
 # ─── Subscribe CTA ────────────────────────────────────────────────────────────
 
-def build_subscribe_cta(font):
-    follow_alpha = "if(lt(t,1.5),0,if(lt(t,2.5),(t-1.5),0.90))"
+def build_subscribe_cta(font, duration=45.0):
+    """
+    Follow / SUBSCRIBE / arrows — moved OFF the face (it used to sit on his sunglasses at h*0.20-0.34)
+    down to the chest area just above the lyrics band, and only shown twice:
+    seconds 3-10, then the last 7 seconds. The music emoji was dropped: the font has no emoji glyph.
+    """
+    end_on = max(10.5, duration - 7.0)
+    # visible window: fade in at 3s, out at 10s; again from end_on to the end
+    show = (f"if(between(t,3,4),(t-3),if(between(t,4,9.5),1,if(between(t,9.5,10.5),(10.5-t),"
+            f"if(between(t,{end_on:.2f},{end_on+1:.2f}),(t-{end_on:.2f}),if(gte(t,{end_on+1:.2f}),1,0)))))")
+
     follow = (
-        f"drawtext=fontfile={font}:text='Follow for more \U0001f3b5':"
+        f"drawtext=fontfile={font}:text='Follow for more':"
         f"fontsize={int(22*UI)}:fontcolor=white@1.0:"
-        f"borderw=2:bordercolor=black@0.80:"
+        f"borderw={int(2*UI)}:bordercolor=black@0.85:"
         f"shadowcolor=black@0.70:shadowx=1:shadowy=1:"
-        f"x=(w-text_w)/2:y=h*0.20:"
-        f"alpha='{follow_alpha}'"
+        f"x=(w-text_w)/2:y=h*0.565:"
+        f"alpha='{show}'"
     )
-    btn_alpha = "if(lt(t,2),0,if(lt(t,3),(t-2),0.88+0.12*abs(sin(2.5*t))))"
     btn_box = (
         f"drawtext=fontfile={font}:text='  SUBSCRIBE  ':"
-        f"fontsize={int(38*UI)}:fontcolor=white@1.0:"
+        f"fontsize={int(34*UI)}:fontcolor=white@1.0:"
         f"borderw=0:"
         f"box=1:boxcolor=0xCC0000@0.92:boxborderw={int(12*UI)}:"
-        f"shadowcolor=0xFF0000@0.50:shadowx=0:shadowy=0:"
-        f"x=(w-text_w)/2:y=h*0.26:"
-        f"alpha='{btn_alpha}'"
+        f"x=(w-text_w)/2:y=h*0.600:"
+        f"alpha='({show})*(0.88+0.12*abs(sin(2.5*t)))'"
     )
-    arr_alpha = "if(lt(t,3),0,0.80+0.20*abs(sin(2.8*t)))"
-    arr_y     = f"trunc(h*0.34)+trunc({int(8*UI)}*abs(sin(2.8*t)))"
+    arr_y  = f"trunc(h*0.655)+trunc({int(8*UI)}*abs(sin(2.8*t)))"
     arrows = (
         f"drawtext=fontfile={font}:text='\u25BC   \u25BC   \u25BC':"
-        f"fontsize={int(22*UI)}:fontcolor=0xFF3333@1.0:"
+        f"fontsize={int(20*UI)}:fontcolor=0xFF3333@1.0:"
         f"borderw=1:bordercolor=black@0.80:"
         f"x=(w-text_w)/2:y={arr_y}:"
-        f"alpha='{arr_alpha}'"
+        f"alpha='{show}'"
     )
     return ",".join([follow, btn_box, arrows])
 
@@ -483,7 +489,7 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
     )
     fade_filter   = f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
     artist_filter = build_artist_watermark(font_italic, artist_name)
-    cta_filter    = build_subscribe_cta(font)
+    cta_filter    = build_subscribe_cta(font, audio_duration)
     eq_filter     = build_eq_bar(font)
 
     vf_parts = [zoom_filter, grade_filter, "format=yuv420p", dark_overlay, artist_filter]
@@ -541,7 +547,7 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
     )
     fade_filter   = f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
     artist_filter = build_artist_watermark(font_italic, artist_name)
-    cta_filter    = build_subscribe_cta(font)
+    cta_filter    = build_subscribe_cta(font, audio_duration)
     eq_filter     = build_eq_bar(font)
 
     vf_parts = [scale_crop, grade_filter, "format=yuv420p", dark_overlay, artist_filter]
