@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py song.py ./
+COPY main.py song.py short.py ./
 
 RUN mkdir -p /app/outputs /app/tmp
 
