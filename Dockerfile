@@ -10,6 +10,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# singer cut-out model for the Shorts (weather goes behind him) - downloaded once at build time
+ENV U2NET_HOME=/app/models
+RUN python -c "from rembg import new_session; new_session('u2net_human_seg')"
+
 COPY main.py song.py short.py ./
 
 RUN mkdir -p /app/outputs /app/tmp
