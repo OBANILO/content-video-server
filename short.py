@@ -222,12 +222,12 @@ def build_artist_watermark(font_italic, artist_name="SORLUNE"):
         f"fontsize={int(34*UI)}:fontcolor=0xD4AF37@1.0:"
         f"borderw=2:bordercolor=black@0.80:"
         f"shadowcolor=black@0.70:shadowx=2:shadowy=2:"
-        f"x=w-text_w-{padding}:y={padding}:alpha='{alpha_expr}'"
+        f"x=w-text_w-{padding}:y=h*0.935:alpha='{alpha_expr}'"
     )
     underline = (
         f"drawtext=fontfile={font_italic}:text='\u2014\u2014\u2014\u2014\u2014\u2014\u2014':"
         f"fontsize={int(14*UI)}:fontcolor=0xD4AF37@1.0:"
-        f"x=w-text_w-{padding}:y={padding+int(42*UI)}:alpha='{alpha_expr}'"
+        f"x=w-text_w-{padding}:y=h*0.935+{int(42*UI)}:alpha='{alpha_expr}'"
     )
     return ",".join([watermark, underline])
 
@@ -468,13 +468,14 @@ def build_weather_fx(fx):
     w, h = OUT_W, OUT_H
     if fx == 'rain':
         # full resolution so streaks stay thin; sparse, slow (a drop crosses the screen in ~4.5 s), softly bright
-        k, density, blur, gain, speed, up = 1, 0.00045, "avgblur=sizeX=1:sizeY=34", 95, 420, False
-        color, alpha = '0xFFF6E2', 0.70
+        # a few drops, falling slowly (one crosses the screen in ~5 s)
+        k, density, blur, gain, speed, up = 1, 0.00012, "avgblur=sizeX=1:sizeY=34", 100, 380, False
+        color, alpha = '0xFFF6E2', 0.75
     elif fx == 'snow':
-        k, density, blur, gain, speed, up = 4, 0.0022, "gblur=sigma=1.3", 14, 120, False
+        k, density, blur, gain, speed, up = 4, 0.0009, "gblur=sigma=1.3", 14, 110, False
         color, alpha = '0xFFFFFF', 0.95
     elif fx == 'embers':
-        k, density, blur, gain, speed, up = 3, 0.0016, "gblur=sigma=1.2", 14, 70, True
+        k, density, blur, gain, speed, up = 3, 0.0007, "gblur=sigma=1.2", 14, 60, True
         color, alpha = '0xFFB347', 0.95
     else:
         return ''
@@ -485,17 +486,39 @@ def build_weather_fx(fx):
         f"geq=lum='if(lt(random(1),{density}),255,0)',{blur},lutyuv=y='min(255,val*{gain})',"
         f"scale={w}:{h}:flags=bilinear,"
         f"split[pa][pb];[pa][pb]vstack,loop=loop=-1:size=1:start=0,setpts=N/25/TB,"
-        f"crop={w}:{h}:0:'{y_expr}'[mask];"
+        f"crop={w}:{h}:0:'{y_expr}',"
+        f"drawbox=x=0:y=0:w=iw:h=ih*0.27:color=black:t=fill[mask];"   # keep the hook text at the top clean
         f"color=c={color}:s={w}x{h}:r=25[pcol];"
         f"[pcol][mask]alphamerge,colorchannelmixer=aa={alpha}[fxl]"
     )
+
+# ─── Subject cut-out: the weather goes BEHIND the singer, never over him ────────
+_SEG_SESSION = None
+
+def make_subject_mask(image_path, mask_path):
+    """White = the singer (hat, hair, suit, microphone, object in his hand), black = background.
+    Returns mask_path, or None if the cut-out is not available — the Short is then made without it."""
+    global _SEG_SESSION
+    try:
+        from rembg import remove, new_session
+        from PIL import Image, ImageFilter
+        if _SEG_SESSION is None:
+            _SEG_SESSION = new_session("u2net_human_seg")
+        img  = Image.open(image_path).convert("RGB")
+        mask = remove(img, session=_SEG_SESSION, only_mask=True)
+        mask = mask.filter(ImageFilter.GaussianBlur(2))     # soft edge, no hard cut line
+        mask.save(mask_path)
+        return mask_path
+    except Exception as e:
+        print(f"[Mask] cut-out unavailable: {e}")
+        return None
 
 # ─── Core FFmpeg — IMAGE MODE (loops image + audio) ───────────────────────────
 
 def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_duration,
                                 font, font_italic, lyrics_font=None,
                                 lyrics_segments=None, artist_name="SORLUNE",
-                                song_title="", fx="rain"):
+                                song_title="", fx="rain", mask_path=None):
     """Build FFmpeg command using static image looped with audio — for shorts"""
     fade_out_st  = max(audio_duration - 3, audio_duration * 0.85)
 
@@ -507,9 +530,9 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
     # Subtle zoom effect on image
     # one still image -> d = every frame of the song, so the zoom really moves (d=1 reset it each frame)
     frames      = int(audio_duration * 25) + 25
-    z_inc       = 0.06 / max(frames, 1)
+    z_inc       = 0.035 / max(frames, 1)
     zoom_filter = (f"scale=2160:3840:force_original_aspect_ratio=increase:flags=lanczos,crop=2160:3840,"
-                   f"zoompan=z='min(1.00+{z_inc:.8f}*on,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                   f"zoompan=z='min(1.00+{z_inc:.8f}*on,1.035)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
                    f":d={frames}:s={OUT_W}x{OUT_H}:fps=25")
 
     # the image is already lit and graded by the AI — only a touch of sharpening, no darkening curves
@@ -527,7 +550,7 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
 
     # background (image + zoom + grade), then the moving weather, then all text on top so it stays clean
     bg_chain = ",".join([zoom_filter, grade_filter, "format=yuv420p"])
-    vf_parts = [dark_overlay, artist_filter]
+    vf_parts = [artist_filter]
 
     title_filter = build_song_title(font, song_title)
     if title_filter:
@@ -542,8 +565,17 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
     vf_parts.append(eq_filter)
     vf_parts.append(fade_filter)
 
-    fx_graph = build_weather_fx(fx)
-    if fx_graph:
+    fx_graph   = build_weather_fx(fx)
+    extra_in   = []
+    if fx_graph and mask_path:
+        # weather on the background, then the clean singer put back on top through his cut-out
+        zoom_only = zoom_filter
+        graph = (f"[0:v]{bg_chain},format=gbrp,split[bg0][bg1];{fx_graph};"
+                 f"[bg0][fxl]overlay=0:0:shortest=1,format=gbrp[rainy];"
+                 f"[2:v]format=gray,{zoom_only},format=gbrp[subj];"
+                 f"[rainy][bg1][subj]maskedmerge,format=yuv420p," + ",".join(vf_parts) + "[v]")
+        extra_in = ['-loop', '1', '-i', mask_path]
+    elif fx_graph:
         graph = (f"[0:v]{bg_chain}[bg];{fx_graph};"
                  f"[bg][fxl]overlay=0:0:shortest=1,format=yuv420p," + ",".join(vf_parts) + "[v]")
     else:
@@ -554,6 +586,7 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
         '-loop', '1',              # ✅ Loop image
         '-i', image_path,          # ✅ Input 0: image
         '-i', audio_path,          # ✅ Input 1: audio
+        *extra_in,                 # ✅ Input 2: singer cut-out (when available)
         '-filter_complex', graph,
         '-map', '[v]',             # ✅ image + weather + text
         '-map', '1:a:0',           # ✅ audio from song
@@ -628,6 +661,10 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
 def generate_short_job(job_id, media_path, audio_path, output_path,
                        is_image=False, lyrics_segments=None,
                        artist_name="SORLUNE", song_title="", fx="rain"):
+    mask_path = None
+    if is_image and fx in WEATHER_FX:
+        save_job(job_id, {'status': 'cutting_out_singer'})
+        mask_path = make_subject_mask(media_path, os.path.join(os.path.dirname(output_path), 'mask.png'))
     try:
         save_job(job_id, {'status': 'processing'})
         audio_duration = get_audio_duration(audio_path)
@@ -643,7 +680,8 @@ def generate_short_job(job_id, media_path, audio_path, output_path,
                 lyrics_segments=lyrics_segments,
                 artist_name=artist_name,
                 song_title=song_title,
-                fx=fx
+                fx=fx,
+                mask_path=mask_path
             )
         else:
             cmd = build_ffmpeg_command_short(
