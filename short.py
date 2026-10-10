@@ -467,8 +467,9 @@ def build_weather_fx(fx):
     rain streaks / snowflakes / embers on a phone instead of pixel dust."""
     w, h = OUT_W, OUT_H
     if fx == 'rain':
-        k, density, blur, gain, speed, up = 2, 0.0040, "avgblur=sizeX=1:sizeY=16", 8, 1800, False
-        color, alpha = '0xFFF4DC', 0.70
+        # full resolution so streaks stay thin; sparse, slow (a drop crosses the screen in ~4.5 s), softly bright
+        k, density, blur, gain, speed, up = 1, 0.00045, "avgblur=sizeX=1:sizeY=34", 95, 420, False
+        color, alpha = '0xFFF6E2', 0.70
     elif fx == 'snow':
         k, density, blur, gain, speed, up = 4, 0.0022, "gblur=sigma=1.3", 14, 120, False
         color, alpha = '0xFFFFFF', 0.95
@@ -507,14 +508,12 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
     # one still image -> d = every frame of the song, so the zoom really moves (d=1 reset it each frame)
     frames      = int(audio_duration * 25) + 25
     z_inc       = 0.06 / max(frames, 1)
-    zoom_filter = (f"scale=2160:3840:flags=lanczos,"
+    zoom_filter = (f"scale=2160:3840:force_original_aspect_ratio=increase:flags=lanczos,crop=2160:3840,"
                    f"zoompan=z='min(1.00+{z_inc:.8f}*on,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
                    f":d={frames}:s={OUT_W}x{OUT_H}:fps=25")
 
-    grade_filter = (
-        "eq=brightness=-0.02:contrast=1.05:saturation=0.95,"
-        "curves=r='0/0 0.5/0.45 1/0.9':g='0/0 0.5/0.42 1/0.85':b='0/0 0.5/0.50 1/1.0'"
-    )
+    # the image is already lit and graded by the AI — only a touch of sharpening, no darkening curves
+    grade_filter = "unsharp=5:5:0.6:5:5:0.0"
     dark_overlay = (
         f"drawtext=fontfile={font}:text=' ':fontsize=1:fontcolor=black@0:"
         f"box=1:boxcolor=black@0.45:boxborderw=0:"
@@ -558,8 +557,8 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
         '-filter_complex', graph,
         '-map', '[v]',             # ✅ image + weather + text
         '-map', '1:a:0',           # ✅ audio from song
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-        '-threads', '2',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '16', '-profile:v', 'high',
+        '-x264-params', 'aq-mode=3', '-threads', '2',
         '-c:a', 'aac', '-b:a', '192k',
         '-pix_fmt', 'yuv420p',
         '-t', str(audio_duration),
