@@ -487,7 +487,8 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
         f"box=1:boxcolor=black@0.45:boxborderw=0:"
         f"x=0:y=h*{DARK_START}:fix_bounds=1"
     )
-    fade_filter   = f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
+    # no fade-in: the very first frame is the Short's cover and its first-second hook (it was 2 s of black)
+    fade_filter   = f"fade=t=out:st={fade_out_st:.2f}:d=3"
     artist_filter = build_artist_watermark(font_italic, artist_name)
     cta_filter    = build_subscribe_cta(font, audio_duration)
     eq_filter     = build_eq_bar(font)
@@ -545,7 +546,8 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
         f"box=1:boxcolor=black@0.55:boxborderw=0:"
         f"x=0:y=h*{DARK_START}:fix_bounds=1"
     )
-    fade_filter   = f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
+    # no fade-in: the very first frame is the Short's cover and its first-second hook (it was 2 s of black)
+    fade_filter   = f"fade=t=out:st={fade_out_st:.2f}:d=3"
     artist_filter = build_artist_watermark(font_italic, artist_name)
     cta_filter    = build_subscribe_cta(font, audio_duration)
     eq_filter     = build_eq_bar(font)
@@ -692,26 +694,51 @@ async def generate_short(request: Request):
             download_file(audio_url, audio_path)
 
             final_audio_path = audio_path
+            lyrics_segments  = []
             try:
                 save_job(job_id, {'status': 'finding_best_segment'})
-                best_start    = find_best_segment(audio_path, short_duration)
+                best_start = find_best_segment(audio_path, short_duration)
+                total      = get_audio_duration(audio_path)
+
+                # a few extra seconds after the loud part, so the cut can slide to where the VOICE starts
+                pre_len = min(short_duration + 12, max(1.0, total - best_start))
+                pre     = os.path.join(job_folder, 'audio_pre.mp3')
+                subprocess.run(['ffmpeg', '-y', '-ss', str(best_start), '-i', audio_path, '-t', str(pre_len),
+                                '-c:a', 'libmp3lame', '-b:a', '192k', pre], capture_output=True, timeout=120)
+                src = pre if os.path.exists(pre) and os.path.getsize(pre) > 1000 else audio_path
+
+                # ✅ VOICE FIRST: people swiped away in the first second because the Short opened on an instrumental bar.
+                # Whisper finds the first sung word; the Short starts 0.25 s before it.
+                offset = 0.0
+                if openai_key:
+                    try:
+                        save_job(job_id, {'status': 'transcribing_lyrics'})
+                        lines = transcribe_lyrics_with_whisper(src, openai_key, lyrics_text)
+                        if lines:
+                            first = float(lines[0]['start'])
+                            if first > 0.6 and first < pre_len - short_duration + 0.5:
+                                offset = max(0.0, first - 0.25)
+                            # keep the captions that fall inside the final cut, moved to its timeline
+                            for ln in lines:
+                                st, en = float(ln['start']) - offset, float(ln['end']) - offset
+                                if en <= 0.1 or st >= short_duration:
+                                    continue
+                                lyrics_segments.append({'start': round(max(0.0, st), 2),
+                                                        'end': round(min(short_duration, en), 2),
+                                                        'text': ln['text']})
+                    except Exception as e:
+                        print(f"[Lyrics] Whisper failed: {e}")
+
                 trimmed_audio = os.path.join(job_folder, 'audio_best.mp3')
                 proc_trim = subprocess.run([
-                    'ffmpeg', '-y', '-ss', str(best_start), '-i', audio_path,
+                    'ffmpeg', '-y', '-ss', str(round(offset, 2)), '-i', src,
                     '-t', str(short_duration), '-c:a', 'libmp3lame', '-b:a', '192k', trimmed_audio
                 ], capture_output=True, timeout=120)
                 if proc_trim.returncode == 0 and os.path.exists(trimmed_audio) and os.path.getsize(trimmed_audio) > 1000:
                     final_audio_path = trimmed_audio
+                save_job(job_id, {'status': 'cut_ready', 'voice_offset': round(offset, 2)})
             except Exception as trim_err:
                 print(f"[Trim] Failed: {trim_err}")
-
-            lyrics_segments = []
-            if openai_key:
-                try:
-                    save_job(job_id, {'status': 'transcribing_lyrics'})
-                    lyrics_segments = transcribe_lyrics_with_whisper(final_audio_path, openai_key, lyrics_text)
-                except Exception as e:
-                    print(f"[Lyrics] Whisper failed: {e}")
 
             if not lyrics_segments and lyrics_text:
                 duration = get_audio_duration(final_audio_path)
