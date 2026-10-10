@@ -456,12 +456,45 @@ def build_karaoke_filter(segments, font, lyrics_font=None):
                 )
     return ",".join(parts)
 
+# ─── Moving weather over the still image (rain / snow / embers) ──────────────
+# One random particle frame is drawn once, stacked twice so it tiles seamlessly,
+# then scrolled every frame — real falling motion at almost no CPU cost.
+WEATHER_FX = ('rain', 'snow', 'embers')
+
+def build_weather_fx(fx):
+    """Returns a filtergraph piece ending in [fxl] (an RGBA particle layer), or '' for none.
+    Particles are drawn at a lower resolution and scaled up, so they read as real
+    rain streaks / snowflakes / embers on a phone instead of pixel dust."""
+    w, h = OUT_W, OUT_H
+    if fx == 'rain':
+        k, density, blur, gain, speed, up = 2, 0.0040, "avgblur=sizeX=1:sizeY=16", 8, 1800, False
+        color, alpha = '0xFFF4DC', 0.70
+    elif fx == 'snow':
+        k, density, blur, gain, speed, up = 4, 0.0022, "gblur=sigma=1.3", 14, 120, False
+        color, alpha = '0xFFFFFF', 0.95
+    elif fx == 'embers':
+        k, density, blur, gain, speed, up = 3, 0.0016, "gblur=sigma=1.2", 14, 70, True
+        color, alpha = '0xFFB347', 0.95
+    else:
+        return ''
+    gw, gh = w // k, h // k
+    y_expr = f"mod(t*{speed},{h})" if up else f"{h}-mod(t*{speed},{h})"
+    return (
+        f"nullsrc=s={gw}x{gh}:r=25:d=0.04,format=gray,"
+        f"geq=lum='if(lt(random(1),{density}),255,0)',{blur},lutyuv=y='min(255,val*{gain})',"
+        f"scale={w}:{h}:flags=bilinear,"
+        f"split[pa][pb];[pa][pb]vstack,loop=loop=-1:size=1:start=0,setpts=N/25/TB,"
+        f"crop={w}:{h}:0:'{y_expr}'[mask];"
+        f"color=c={color}:s={w}x{h}:r=25[pcol];"
+        f"[pcol][mask]alphamerge,colorchannelmixer=aa={alpha}[fxl]"
+    )
+
 # ─── Core FFmpeg — IMAGE MODE (loops image + audio) ───────────────────────────
 
 def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_duration,
                                 font, font_italic, lyrics_font=None,
                                 lyrics_segments=None, artist_name="SORLUNE",
-                                song_title=""):
+                                song_title="", fx="rain"):
     """Build FFmpeg command using static image looped with audio — for shorts"""
     fade_out_st  = max(audio_duration - 3, audio_duration * 0.85)
 
@@ -493,7 +526,9 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
     cta_filter    = build_subscribe_cta(font, audio_duration)
     eq_filter     = build_eq_bar(font)
 
-    vf_parts = [zoom_filter, grade_filter, "format=yuv420p", dark_overlay, artist_filter]
+    # background (image + zoom + grade), then the moving weather, then all text on top so it stays clean
+    bg_chain = ",".join([zoom_filter, grade_filter, "format=yuv420p"])
+    vf_parts = [dark_overlay, artist_filter]
 
     title_filter = build_song_title(font, song_title)
     if title_filter:
@@ -508,13 +543,20 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
     vf_parts.append(eq_filter)
     vf_parts.append(fade_filter)
 
+    fx_graph = build_weather_fx(fx)
+    if fx_graph:
+        graph = (f"[0:v]{bg_chain}[bg];{fx_graph};"
+                 f"[bg][fxl]overlay=0:0:shortest=1,format=yuv420p," + ",".join(vf_parts) + "[v]")
+    else:
+        graph = f"[0:v]{bg_chain}," + ",".join(vf_parts) + "[v]"
+
     return [
         'ffmpeg', '-y',
         '-loop', '1',              # ✅ Loop image
         '-i', image_path,          # ✅ Input 0: image
         '-i', audio_path,          # ✅ Input 1: audio
-        '-vf', ",".join(vf_parts),
-        '-map', '0:v:0',           # ✅ video from image
+        '-filter_complex', graph,
+        '-map', '[v]',             # ✅ image + weather + text
         '-map', '1:a:0',           # ✅ audio from song
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
         '-threads', '2',
@@ -586,7 +628,7 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
 
 def generate_short_job(job_id, media_path, audio_path, output_path,
                        is_image=False, lyrics_segments=None,
-                       artist_name="SORLUNE", song_title=""):
+                       artist_name="SORLUNE", song_title="", fx="rain"):
     try:
         save_job(job_id, {'status': 'processing'})
         audio_duration = get_audio_duration(audio_path)
@@ -601,7 +643,8 @@ def generate_short_job(job_id, media_path, audio_path, output_path,
                 lyrics_font=lyrics_font,
                 lyrics_segments=lyrics_segments,
                 artist_name=artist_name,
-                song_title=song_title
+                song_title=song_title,
+                fx=fx
             )
         else:
             cmd = build_ffmpeg_command_short(
@@ -663,6 +706,8 @@ async def generate_short(request: Request):
     lyrics_text    = (data.get('lyrics') or '').strip()
     openai_key     = (data.get('openai_key') or '').strip()
     song_title     = (data.get('title') or '').strip()
+    fx             = (data.get('fx') or 'rain').strip().lower()
+    if fx not in WEATHER_FX + ('none',): fx = 'rain'
 
     if not audio_url or (not image_url and not pexels_url):
         return JSONResponse({'error': 'Missing audio_url and image_url or pexels_url'}, status_code=400)
@@ -753,7 +798,7 @@ async def generate_short(request: Request):
 
             generate_short_job(job_id, media_path, final_audio_path, output_path,
                                is_image=use_image, lyrics_segments=lyrics_segments,
-                               artist_name=artist_name, song_title=song_title)
+                               artist_name=artist_name, song_title=song_title, fx=fx)
         except Exception as e:
             save_job(job_id, {'status': 'error', 'error': str(e)})
             print(f"[Job {job_id}] {e}")
