@@ -493,25 +493,32 @@ def build_weather_fx(fx):
     )
 
 # ─── Subject cut-out: the weather goes BEHIND the singer, never over him ────────
-_SEG_SESSION = None
+_MASK_SCRIPT = r"""
+import sys
+from PIL import Image, ImageFilter
+from rembg import remove, new_session
+img  = Image.open(sys.argv[1]).convert("RGB")
+img.thumbnail((1200, 1200 * 16 // 9))          # the model works at 320 px anyway; keeps memory low
+mask = remove(img, session=new_session("u2net_human_seg"), only_mask=True)
+mask = mask.filter(ImageFilter.GaussianBlur(1.5))
+mask.save(sys.argv[2])
+"""
 
 def make_subject_mask(image_path, mask_path):
     """White = the singer (hat, hair, suit, microphone, object in his hand), black = background.
-    Returns mask_path, or None if the cut-out is not available — the Short is then made without it."""
-    global _SEG_SESSION
+    Runs in its own process so the model's memory is released before the video render starts
+    (kept loaded inside the server it pushed the 2 GB instance over its limit).
+    Returns mask_path, or None — the Short is then made without the cut-out."""
+    import sys as _sys
     try:
-        from rembg import remove, new_session
-        from PIL import Image, ImageFilter
-        if _SEG_SESSION is None:
-            _SEG_SESSION = new_session("u2net_human_seg")
-        img  = Image.open(image_path).convert("RGB")
-        mask = remove(img, session=_SEG_SESSION, only_mask=True)
-        mask = mask.filter(ImageFilter.GaussianBlur(2))     # soft edge, no hard cut line
-        mask.save(mask_path)
-        return mask_path
+        r = subprocess.run([_sys.executable, "-c", _MASK_SCRIPT, image_path, mask_path],
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode == 0 and os.path.exists(mask_path):
+            return mask_path
+        print(f"[Mask] failed: {r.stderr[-400:]}")
     except Exception as e:
         print(f"[Mask] cut-out unavailable: {e}")
-        return None
+    return None
 
 # ─── Core FFmpeg — IMAGE MODE (loops image + audio) ───────────────────────────
 
@@ -582,7 +589,8 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
         graph = f"[0:v]{bg_chain}," + ",".join(vf_parts) + "[v]"
 
     return [
-        'ffmpeg', '-y',
+        'ffmpeg', '-y', '-nostdin',
+        '-filter_complex_threads', '1', '-filter_threads', '1',
         '-loop', '1',              # ✅ Loop image
         '-i', image_path,          # ✅ Input 0: image
         '-i', audio_path,          # ✅ Input 1: audio
@@ -590,8 +598,8 @@ def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_durati
         '-filter_complex', graph,
         '-map', '[v]',             # ✅ image + weather + text
         '-map', '1:a:0',           # ✅ audio from song
-        '-c:v', 'libx264', '-preset', 'medium', '-crf', '16', '-profile:v', 'high',
-        '-x264-params', 'aq-mode=3', '-threads', '2',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17', '-profile:v', 'high',
+        '-x264-params', 'aq-mode=3:rc-lookahead=10', '-threads', '2',
         '-c:a', 'aac', '-b:a', '192k',
         '-pix_fmt', 'yuv420p',
         '-t', str(audio_duration),
